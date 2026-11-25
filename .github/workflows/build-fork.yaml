@@ -18,7 +18,7 @@ on:
           - macos
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.platform || 'push' }}
   cancel-in-progress: true
 
 env:
