@@ -2,7 +2,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 index d6f6134..972caa3 100644
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
-@@ -4,15 +4,217 @@ import (
+@@ -4,15 +4,248 @@ import (
  	"context"
  	"encoding/json"
  	"errors"
@@ -41,6 +41,7 @@ index d6f6134..972caa3 100644
 +)
 +
 +type proxyFailState struct {
++	proxy         C.Proxy
 +	suspectHosts  map[string]time.Time
 +	cooldownUntil time.Time
 +	backoffLevel  int
@@ -62,43 +63,71 @@ index d6f6134..972caa3 100644
 +
 +type fallbackObserverConn struct {
 +	C.Conn
++	group        *Fallback
++	proxy        C.Proxy
 +	stallTimeout time.Duration
 +	closed       atomic.Bool
 +	done         atomic.Bool
-+	timer        atomic.Pointer[time.Timer]
++	stalled      atomic.Bool
++	watchdogMux  sync.Mutex
++	lastWrite    time.Time
++	timer        *time.Timer
 +	onSuccess    func()
 +	onSuspect    func(err error, strong bool)
 +}
 +
 +func (c *fallbackObserverConn) armWatchdog() {
-+	if c.done.Load() || c.closed.Load() || c.timer.Load() != nil {
++	c.watchdogMux.Lock()
++	defer c.watchdogMux.Unlock()
++	c.stalled.Store(false)
++	if c.done.Load() || c.closed.Load() {
++		return
++	}
++	c.lastWrite = time.Now()
++	if c.timer != nil {
 +		return
 +	}
 +	timeout := c.stallTimeout
 +	if timeout <= 0 {
 +		timeout = fallbackMinStallThreshold
 +	}
-+	t := time.AfterFunc(timeout, func() {
-+		if !c.closed.Load() && c.done.CompareAndSwap(false, true) && c.onSuspect != nil {
++	c.timer = time.AfterFunc(timeout, func() {
++		c.watchdogMux.Lock()
++		if c.done.Load() || c.closed.Load() || c.timer == nil {
++			c.watchdogMux.Unlock()
++			return
++		}
++		if remaining := timeout - time.Since(c.lastWrite); remaining > 0 {
++			c.timer.Reset(remaining)
++			c.watchdogMux.Unlock()
++			return
++		}
++		c.stalled.Store(true)
++		stalled := c.done.CompareAndSwap(false, true)
++		if !stalled {
++			c.stalled.Store(false)
++		}
++		c.watchdogMux.Unlock()
++		if stalled && c.onSuspect != nil {
 +			c.onSuspect(context.DeadlineExceeded, true)
 +		}
 +	})
-+	if !c.timer.CompareAndSwap(nil, t) {
-+		t.Stop()
-+	} else if c.done.Load() || c.closed.Load() {
-+		t.Stop()
-+	}
 +}
 +
 +func (c *fallbackObserverConn) stopWatchdog() {
-+	if t := c.timer.Swap(nil); t != nil {
-+		t.Stop()
++	c.watchdogMux.Lock()
++	if c.timer != nil {
++		c.timer.Stop()
++		c.timer = nil
 +	}
++	c.watchdogMux.Unlock()
 +}
 +
 +func (c *fallbackObserverConn) markSuccess() {
++	success := c.done.CompareAndSwap(false, true)
 +	c.stopWatchdog()
-+	if c.done.CompareAndSwap(false, true) && c.onSuccess != nil {
++	c.stalled.Store(false)
++	if success && c.onSuccess != nil {
 +		c.onSuccess()
 +	}
 +}
@@ -115,12 +144,10 @@ index d6f6134..972caa3 100644
 +
 +func (c *fallbackObserverConn) Read(b []byte) (int, error) {
 +	n, err := c.Conn.Read(b)
-+	if !c.done.Load() {
-+		if n > 0 {
-+			c.markSuccess()
-+		} else if err != nil {
-+			c.markError(err)
-+		}
++	if n > 0 {
++		c.markSuccess()
++	} else if !c.done.Load() && err != nil {
++		c.markError(err)
 +	}
 +	return n, err
 +}
@@ -128,24 +155,21 @@ index d6f6134..972caa3 100644
 +func (c *fallbackObserverConn) ReadBuffer(buffer *buf.Buffer) error {
 +	before := buffer.Len()
 +	err := c.Conn.ReadBuffer(buffer)
-+	if !c.done.Load() {
-+		if buffer.Len() > before {
-+			c.markSuccess()
-+		} else if err != nil {
-+			c.markError(err)
-+		}
++	if buffer.Len() > before {
++		c.markSuccess()
++	} else if !c.done.Load() && err != nil {
++		c.markError(err)
 +	}
 +	return err
 +}
 +
 +func (c *fallbackObserverConn) Write(b []byte) (int, error) {
 +	n, err := c.Conn.Write(b)
-+	if !c.done.Load() {
-+		if err != nil {
-+			c.markError(err)
-+		} else if n > 0 {
-+			c.armWatchdog()
-+		}
++	if n > 0 {
++		c.armWatchdog()
++	}
++	if !c.done.Load() && err != nil {
++		c.markError(err)
 +	}
 +	return n, err
 +}
@@ -153,12 +177,11 @@ index d6f6134..972caa3 100644
 +func (c *fallbackObserverConn) WriteBuffer(buffer *buf.Buffer) error {
 +	dataLen := buffer.Len()
 +	err := c.Conn.WriteBuffer(buffer)
-+	if !c.done.Load() {
-+		if err != nil {
-+			c.markError(err)
-+		} else if dataLen > 0 {
-+			c.armWatchdog()
-+		}
++	if err == nil && dataLen > 0 {
++		c.armWatchdog()
++	}
++	if !c.done.Load() && err != nil {
++		c.markError(err)
 +	}
 +	return err
 +}
@@ -170,11 +193,19 @@ index d6f6134..972caa3 100644
 +}
 +
 +func (c *fallbackObserverConn) ReaderReplaceable() bool {
-+	return c.done.Load()
++	return c.done.Load() && !c.stalled.Load()
++}
++
++func (c *fallbackObserverConn) ReaderPossiblyReplaceable() bool {
++	return !c.ReaderReplaceable()
 +}
 +
 +func (c *fallbackObserverConn) WriterReplaceable() bool {
-+	return c.done.Load()
++	return c.done.Load() && !c.stalled.Load()
++}
++
++func (c *fallbackObserverConn) WriterPossiblyReplaceable() bool {
++	return !c.WriterReplaceable()
 +}
 +
 +func (c *fallbackObserverConn) Upstream() any {
@@ -220,7 +251,7 @@ index d6f6134..972caa3 100644
  type FallbackOption struct{}
  
  type Fallback struct {
-@@ -21,6 +223,464 @@ type Fallback struct {
+@@ -21,6 +254,482 @@ type Fallback struct {
  	testUrl        string
  	selected       string
  	expectedStatus string
@@ -329,9 +360,31 @@ index d6f6134..972caa3 100644
 +	return fallbackCloseSampleDelay
 +}
 +
-+func (f *Fallback) isDemotedLocked(name string, now time.Time) bool {
-+	st, ok := f.proxyStates[name]
-+	if !ok {
++func (f *Fallback) proxyStateLocked(proxy C.Proxy) *proxyFailState {
++	for _, current := range f.GetProxies(false) {
++		if current != proxy {
++			continue
++		}
++		if f.proxyStates == nil {
++			f.proxyStates = make(map[string]*proxyFailState)
++		}
++		name := proxy.Name()
++		st := f.proxyStates[name]
++		if st == nil || st.proxy != proxy {
++			if st != nil {
++				st.stopProbeTimerLocked()
++			}
++			st = &proxyFailState{proxy: proxy}
++			f.proxyStates[name] = st
++		}
++		return st
++	}
++	return nil
++}
++
++func (f *Fallback) isDemotedLocked(proxy C.Proxy, now time.Time) bool {
++	st, ok := f.proxyStates[proxy.Name()]
++	if !ok || st.proxy != proxy {
 +		return false
 +	}
 +	return now.Before(st.cooldownUntil)
@@ -350,18 +403,14 @@ index d6f6134..972caa3 100644
 +	name := proxy.Name()
 +
 +	f.stateMux.Lock()
-+	if f.proxyStates == nil {
-+		f.proxyStates = make(map[string]*proxyFailState)
++	if owner != nil && f.proxyStates[name] != owner {
++		f.stateMux.Unlock()
++		return
 +	}
-+	st, ok := f.proxyStates[name]
-+	if owner != nil {
-+		if !ok || st != owner {
-+			f.stateMux.Unlock()
-+			return
-+		}
-+	} else if !ok {
-+		st = &proxyFailState{}
-+		f.proxyStates[name] = st
++	st := f.proxyStateLocked(proxy)
++	if st == nil || (owner != nil && st != owner) {
++		f.stateMux.Unlock()
++		return
 +	}
 +
 +	// Avoid escalating backoff multiple times within an already-active cooldown.
@@ -386,52 +435,58 @@ index d6f6134..972caa3 100644
 +	f.stateMux.Unlock()
 +
 +	log.Warnln("Fallback[%s]: proxy %s demoted for %v (%s)", f.Name(), name, cooldown, reason)
-+	go f.closeStalledConnectionsForProxy(name)
++	go f.closeStalledConnectionsForProxy(proxy, st)
 +}
 +
-+func (f *Fallback) closeStalledConnectionsForProxy(proxyName string) {
++func (f *Fallback) closeStalledConnectionsForProxy(proxy C.Proxy, owner *proxyFailState) {
 +	groupName := f.Name()
-+	snap := make(map[statistic.Tracker]int64)
++	type trafficSample struct {
++		observer *fallbackObserverConn
++		upload   int64
++		download int64
++	}
++	samples := make(map[statistic.Tracker]trafficSample)
 +	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
++		observer, ok := N.FindUpstream[*fallbackObserverConn](c, func(observer *fallbackObserverConn) bool {
++			return observer.group == f && observer.proxy == proxy && observer.stalled.Load() && !observer.closed.Load()
++		})
++		if !ok {
++			return true
++		}
 +		info := c.Info()
 +		if info == nil {
 +			return true
 +		}
-+		hasGroup := false
-+		hasProxy := false
-+		for _, chainName := range info.Chain {
-+			if chainName == groupName {
-+				hasGroup = true
-+			} else if chainName == proxyName {
-+				hasProxy = true
-+			}
-+		}
-+		if hasGroup && hasProxy {
-+			snap[c] = info.DownloadTotal.Load()
++		samples[c] = trafficSample{
++			observer: observer,
++			upload:   info.UploadTotal.Load(),
++			download: info.DownloadTotal.Load(),
 +		}
 +		return true
 +	})
 +
-+	if len(snap) == 0 {
++	if len(samples) == 0 {
 +		return
 +	}
 +
 +	time.Sleep(f.effectiveCloseSampleDelay())
 +
 +	closedCount := 0
-+	for c, prevDownload := range snap {
++	for c, sample := range samples {
 +		info := c.Info()
-+		if info == nil {
++		if info == nil || sample.observer.closed.Load() || !sample.observer.stalled.Load() {
 +			continue
 +		}
-+		// Only close connections whose downloaded bytes did not advance during the sample window.
-+		if info.DownloadTotal.Load() == prevDownload {
++		f.stateMux.Lock()
++		current := f.proxyStates[proxy.Name()] == owner && f.proxyStateLocked(proxy) == owner
++		f.stateMux.Unlock()
++		if current && info.UploadTotal.Load() == sample.upload && info.DownloadTotal.Load() == sample.download {
 +			_ = c.Close()
 +			closedCount++
 +		}
 +	}
 +	if closedCount > 0 {
-+		log.Warnln("Fallback[%s]: closed %d stalled connections on demoted proxy %s", groupName, closedCount, proxyName)
++		log.Warnln("Fallback[%s]: closed %d stalled connections on demoted proxy %s", groupName, closedCount, proxy.Name())
 +	}
 +}
 +
@@ -447,7 +502,7 @@ index d6f6134..972caa3 100644
 +		if p.Name() == excludeName || isSkippableAdapter(p.Type()) {
 +			continue
 +		}
-+		if !f.isDemotedLocked(p.Name(), now) {
++		if !f.isDemotedLocked(p, now) {
 +			if p.AliveForTestUrl(f.testUrl) {
 +				return p
 +			}
@@ -488,7 +543,6 @@ index d6f6134..972caa3 100644
 +	}
 +
 +	now := time.Now()
-+	name := proxy.Name()
 +	if host == "" {
 +		host = "_unknown_"
 +	}
@@ -497,16 +551,8 @@ index d6f6134..972caa3 100644
 +	shouldProbe := false
 +
 +	f.stateMux.Lock()
-+	if f.proxyStates == nil {
-+		f.proxyStates = make(map[string]*proxyFailState)
-+	}
-+	st, ok := f.proxyStates[name]
-+	if !ok {
-+		st = &proxyFailState{}
-+		f.proxyStates[name] = st
-+	}
-+
-+	if now.Before(st.cooldownUntil) {
++	st := f.proxyStateLocked(proxy)
++	if st == nil || now.Before(st.cooldownUntil) {
 +		f.stateMux.Unlock()
 +		return
 +	}
@@ -578,7 +624,7 @@ index d6f6134..972caa3 100644
 +
 +	f.stateMux.Lock()
 +	st, ok := f.proxyStates[name]
-+	if !ok || st != owner || st.probeGen != gen {
++	if !ok || st != owner || st.probeGen != gen || f.proxyStateLocked(proxy) != owner {
 +		f.stateMux.Unlock()
 +		return
 +	}
@@ -605,9 +651,15 @@ index d6f6134..972caa3 100644
 +	name := proxy.Name()
 +	peer := f.findProbePeer(name)
 +	go func() {
++		f.stateMux.Lock()
++		current := f.proxyStates[name] == owner && f.proxyStateLocked(proxy) == owner
++		f.stateMux.Unlock()
++		if !current {
++			return
++		}
 +		defer func() {
 +			f.stateMux.Lock()
-+			if st, ok := f.proxyStates[name]; ok && st == owner {
++			if st, ok := f.proxyStates[name]; ok && st == owner && f.proxyStateLocked(proxy) == owner {
 +				st.probing = false
 +				if st.pendingProbe && st.probeTimer == nil && !time.Now().Before(st.cooldownUntil) {
 +					st.pendingProbe = false
@@ -621,7 +673,7 @@ index d6f6134..972caa3 100644
 +		defer cancel()
 +
 +		errSelf, errPeer := f.probePair(ctx, proxy, peer)
-+		// Only demote when self fails AND peer succeeds AND the state owner has not been replaced.
++		// Comparative health results apply to the current proxy instance and state owner.
 +		if errSelf != nil && errPeer == nil {
 +			f.demoteProxyIfOwner(proxy, owner, "comparative URLTest failed while peer ok: "+errSelf.Error())
 +		}
@@ -634,20 +686,16 @@ index d6f6134..972caa3 100644
 +	}
 +
 +	now := time.Now()
-+	name := proxy.Name()
-+
 +	f.stateMux.Lock()
-+	if st, ok := f.proxyStates[name]; ok {
-+		// Never clear an active cooldown due to a late response from an older connection.
-+		if now.Before(st.cooldownUntil) {
-+			f.stateMux.Unlock()
-+			return
-+		}
-+		st.suspectHosts = nil
-+		if st.backoffLevel > 0 && !st.cooldownUntil.IsZero() && now.Sub(st.cooldownUntil) >= f.effectiveRecoveryWindow() {
-+			st.backoffLevel--
-+			st.cooldownUntil = now
-+		}
++	st := f.proxyStateLocked(proxy)
++	if st == nil || now.Before(st.cooldownUntil) {
++		f.stateMux.Unlock()
++		return
++	}
++	st.suspectHosts = nil
++	if st.backoffLevel > 0 && !st.cooldownUntil.IsZero() && now.Sub(st.cooldownUntil) >= f.effectiveRecoveryWindow() {
++		st.backoffLevel--
++		st.cooldownUntil = now
 +	}
 +	f.stateMux.Unlock()
 +
@@ -660,11 +708,10 @@ index d6f6134..972caa3 100644
 +		p := proxy
 +		c = callback.NewFirstWriteCallBackConn(c, func(wErr error) {
 +			if wErr == nil {
-+				// First write succeeding only means bytes entered the transport;
-+				// do NOT clear suspectHosts until a real response byte is received.
++				// First-response observation owns suspect-host recovery.
 +				f.onDialSuccess()
 +			} else if !isIgnoredFallbackError(wErr) {
-+				f.reportSuspect(p, host, true)
++				f.reportSuspect(p, host, isStrongFallbackError(wErr))
 +			}
 +		})
 +	}
@@ -672,6 +719,8 @@ index d6f6134..972caa3 100644
 +		p := proxy
 +		c = &fallbackObserverConn{
 +			Conn:         c,
++			group:        f,
++			proxy:        p,
 +			stallTimeout: f.stallTimeoutForProxy(p),
 +			onSuccess: func() {
 +				f.recordProxySuccess(p)
@@ -685,7 +734,7 @@ index d6f6134..972caa3 100644
  }
  
  func (f *Fallback) Now() string {
-@@ -28,38 +688,176 @@ func (f *Fallback) Now() string {
+@@ -28,38 +737,178 @@ func (f *Fallback) Now() string {
  	return proxy.Name()
  }
  
@@ -753,7 +802,7 @@ index d6f6134..972caa3 100644
 +	stagger := time.NewTimer(f.staggerDelayForProxy(candidates[0]))
 +	defer stagger.Stop()
 +
-+	var failedProxies []C.Proxy
++	var failedResults []fallbackDialResult
 +	var lastErr error
 +
 +	for completed < maxAttempts {
@@ -779,9 +828,8 @@ index d6f6134..972caa3 100644
 +					}(remaining)
 +				}
 +
-+				// Other candidates failed while this one succeeded: not a local outage.
-+				for _, fp := range failedProxies {
-+					f.demoteProxy(fp, "dial failed while backup succeeded")
++				for _, failed := range failedResults {
++					f.reportSuspect(failed.proxy, host, isStrongFallbackError(failed.err))
 +				}
 +				return f.wrapObservedConn(res.conn, res.proxy, host), nil
  			}
@@ -789,7 +837,7 @@ index d6f6134..972caa3 100644
 +
 +			lastErr = res.err
 +			if ctx.Err() == nil && !isIgnoredFallbackError(res.err) {
-+				failedProxies = append(failedProxies, res.proxy)
++				failedResults = append(failedResults, res)
 +			}
 +			if launched < maxAttempts {
 +				nextProxy := candidates[launched]
@@ -871,8 +919,11 @@ index d6f6134..972caa3 100644
 +		}
 +
 +		lastErr = err
-+		if ctx.Err() != nil || errors.Is(err, C.ErrNotSupport) {
++		if ctx.Err() != nil {
 +			return nil, err
++		}
++		if errors.Is(err, C.ErrNotSupport) {
++			continue
 +		}
 +		failedProxies = append(failedProxies, proxy)
 +	}
@@ -881,7 +932,7 @@ index d6f6134..972caa3 100644
  }
  
  // SupportUDP implements C.ProxyAdapter
-@@ -83,13 +881,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+@@ -83,13 +932,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
  	for _, proxy := range f.GetProxies(false) {
  		all = append(all, proxy.Name())
  	}
@@ -899,7 +950,7 @@ index d6f6134..972caa3 100644
  		"hidden":         f.Hidden(),
  		"icon":           f.Icon(),
  		"emptyFallback":  f.EmptyFallback().Name(),
-@@ -102,25 +903,82 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+@@ -102,25 +954,82 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
  	return proxy
  }
  
@@ -916,12 +967,12 @@ index d6f6134..972caa3 100644
 +	// Periodically prune states for proxies that were removed or replaced in providers.
 +	if len(f.proxyStates) > 0 && now.Sub(f.lastPrune) >= fallbackPruneInterval {
 +		f.lastPrune = now
-+		active := make(map[string]struct{}, len(proxies))
++		active := make(map[string]C.Proxy, len(proxies))
 +		for _, p := range proxies {
-+			active[p.Name()] = struct{}{}
++			active[p.Name()] = p
 +		}
 +		for name, st := range f.proxyStates {
-+			if _, ok := active[name]; !ok {
++			if active[name] != st.proxy {
 +				st.stopProbeTimerLocked()
 +				delete(f.proxyStates, name)
  			}
@@ -937,7 +988,7 @@ index d6f6134..972caa3 100644
 +	if len(selected) > 0 {
 +		for _, proxy := range proxies {
 +			if proxy.Name() == selected {
-+				if proxy.AliveForTestUrl(f.testUrl) && !f.isDemotedLocked(selected, now) {
++				if proxy.AliveForTestUrl(f.testUrl) && !f.isDemotedLocked(proxy, now) {
 +					selectedProxy = proxy
  				} else {
  					f.selected = ""
@@ -960,7 +1011,7 @@ index d6f6134..972caa3 100644
 +		if selectedProxy != nil && proxy.Name() == selectedProxy.Name() {
 +			continue
 +		}
-+		demoted := f.isDemotedLocked(proxy.Name(), now)
++		demoted := f.isDemotedLocked(proxy, now)
 +		if proxy.AliveForTestUrl(f.testUrl) {
 +			if !demoted {
 +				aliveHealthy = append(aliveHealthy, proxy)
@@ -992,7 +1043,7 @@ index d6f6134..972caa3 100644
  }
  
  func (f *Fallback) Set(name string) error {
-@@ -136,7 +994,14 @@ func (f *Fallback) Set(name string) error {
+@@ -136,7 +1045,14 @@ func (f *Fallback) Set(name string) error {
  		return errors.New("proxy not exist")
  	}
  
@@ -1007,7 +1058,7 @@ index d6f6134..972caa3 100644
  	if !p.AliveForTestUrl(f.testUrl) {
  		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
  		defer cancel()
-@@ -148,7 +1013,13 @@ func (f *Fallback) Set(name string) error {
+@@ -148,7 +1064,13 @@ func (f *Fallback) Set(name string) error {
  }
  
  func (f *Fallback) ForceSet(name string) {
@@ -1021,7 +1072,7 @@ index d6f6134..972caa3 100644
  }
  
  func (f *Fallback) Providers() []P.ProxyProvider {
-@@ -178,5 +1049,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+@@ -178,5 +1100,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
  		expectedStatus: option.ExpectedStatus,

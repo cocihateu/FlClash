@@ -12,7 +12,12 @@ Update submodules first. The ClashMeta Go core lives in `core/Clash.Meta/`, the 
 
 ```bash
 git submodule update --init --recursive
+git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
 ```
+
+Apply the fallback patch once after initializing the pinned Core submodule. This fork's fallback uses
+comparative health checks, instance-scoped cooldowns, staggered TCP attempts and sequential UDP fallback.
+Local builds and Build Fork compile the same patched source.
 
 Full package build, including Go core, Flutter, and packaging, runs through `tool/package.dart` (`make package`,
 `make package-android`, with `ARCH=`, `FORM=` and `DRY=1`). Run it with `dart`, not `dart run`, which first runs
@@ -23,6 +28,15 @@ dart tool/package.dart                     # this host: dmg, exe + zip, or deb +
 dart tool/package.dart android             # every ABI; --arch arm64 for one
 dart tool/package.dart linux --dry-run --arch arm64   # names and steps only, any platform
 ```
+
+Build Fork runs Android and Windows on each push to `main`. It passes `--tag v0.9.4` to keep artifact names
+fixed; the installed version and build number come from `pubspec.yaml`, currently `0.9.4+2026110401`.
+Use `dart tool/package.dart android --tag v0.9.4` or `dart tool/package.dart windows --tag v0.9.4`
+for the same local package names. The general `build` workflow has a manual entry point.
+
+Android CI uses the existing `SIGNING_KEYSTORE_BASE64`, `SIGNING_KEY_ALIAS`, `SIGNING_STORE_PASSWORD`
+and `SIGNING_KEY_PASSWORD` repository secrets for every release. Signed releases use
+`com.cocihateu.flclash`; the app's update source is `cocihateu/FlClash`.
 
 Artifacts land in `dist/` as `FlClash-<version>-<os>-<arch>[-<form>].<ext>`, with `manifest.json` and
 `FlClash-<version>-SHA256SUMS`; see Packaging in `architecture.md`.
@@ -97,9 +111,10 @@ Use `flutter test`, not `dart test`, because models pull in Flutter types.
 A development build takes over the host exactly like a release: it creates the TUN device, sets the system proxy, on
 macOS registers the TUN as the system resolver, registers itself as the login item, and on Windows and Linux starts its
 Core through the shared privileged Helper, which stops the Core an installed FlClash is running. Only the data directory
-is kept apart, and only for some builds: a macOS debug build is `com.follow.clash.debug` and an Android debug build `com.follow.clash.dev`,
-while profile and release builds, and every build on Windows and Linux, share the directory and preferences of the
-installed app. Safe mode keeps all of the host changes off and never opens the Core's listeners or external
+is kept apart, and only for some builds: a macOS debug build is `com.follow.clash.debug` and an Android debug build is
+`com.cocihateu.flclash.dev`. Android releases using debug signing also use `.dev`; releases using the configured
+release key use `com.cocihateu.flclash`. macOS profile and release builds, and every build on Windows and Linux,
+share the directory and preferences of the installed app. Safe mode keeps all of the host changes off and never opens the Core's listeners or external
 controller, so it does not compete with the installed app for the mixed, DNS, RESTful API and other loopback ports:
 
 ```bash
