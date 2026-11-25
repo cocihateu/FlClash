@@ -1,0 +1,179 @@
+name: Build Fork
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Target platform'
+        required: true
+        default: 'android'
+        type: choice
+        options:
+          - android
+          - windows
+          - linux
+          - macos
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: '3.50.0'
+  GO_VERSION: '1.27.1'
+  NDK_VERSION: r28c
+
+jobs:
+  build-android:
+    if: github.event_name == 'push' || inputs.platform == 'android'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply Mihomo Fallback Enhancement
+        shell: bash
+        run: |
+          git -C core/Clash.Meta apply --check "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+
+      - name: Setup Android Signing
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE || secrets.SIGNING_KEYSTORE_BASE64 }}
+          KEY_ALIAS_VAL: ${{ secrets.KEY_ALIAS || secrets.SIGNING_KEY_ALIAS }}
+          STORE_PASS_VAL: ${{ secrets.STORE_PASSWORD || secrets.SIGNING_STORE_PASSWORD }}
+          KEY_PASS_VAL: ${{ secrets.KEY_PASSWORD || secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > android/app/keystore.jks
+            {
+              echo "keyAlias=$KEY_ALIAS_VAL"
+              echo "storePassword=$STORE_PASS_VAL"
+              echo "keyPassword=$KEY_PASS_VAL"
+            } >> android/local.properties
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: core/go.sum
+
+      - name: Verify Mihomo Fallback Patch
+        working-directory: core/Clash.Meta
+        env:
+          CGO_ENABLED: 1
+        run: |
+          go vet ./adapter/outboundgroup/...
+          go test -race -v ./adapter/outboundgroup -run TestFallback
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: build-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Get Flutter Dependency
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Fetch CA certificates
+        shell: bash
+        env:
+          CA_BUNDLE: cacert-2026-09-25.pem
+          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+        run: |
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+
+      - name: Build Android APK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.build-ndk.outputs.ndk-path }}
+        run: dart tool/package.dart android -v
+
+      - name: Upload Android Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlClash-android-fallback
+          path: ./dist
+          overwrite: true
+
+  build-desktop:
+    if: github.event_name == 'workflow_dispatch' && inputs.platform != 'android'
+    runs-on: ${{ inputs.platform == 'windows' && 'windows-2022' || (inputs.platform == 'macos' && 'macos-latest' || 'ubuntu-22.04') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply Mihomo Fallback Enhancement
+        shell: bash
+        run: |
+          git -C core/Clash.Meta apply --check "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: core/go.sum
+
+      - name: Enable git long paths (Windows)
+        if: inputs.platform == 'windows'
+        run: git config --global core.longpaths true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Get Flutter Dependency
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Fetch CA certificates
+        shell: bash
+        env:
+          CA_BUNDLE: cacert-2026-09-25.pem
+          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+        run: |
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+
+      - name: Build Desktop
+        env:
+          FLUTTER_MACOS_ARM64_ONLY: ${{ inputs.platform == 'macos' }}
+        run: dart tool/package.dart ${{ inputs.platform }} -v
+
+      - name: Upload Desktop Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FlClash-${{ inputs.platform }}-fallback
+          path: ./dist
+          overwrite: true
