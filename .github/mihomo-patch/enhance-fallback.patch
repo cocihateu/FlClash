@@ -2,7 +2,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 index d6f6134..972caa3 100644
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
-@@ -4,15 +4,253 @@ import (
+@@ -4,15 +4,256 @@ import (
  	"context"
  	"encoding/json"
  	"errors"
@@ -95,22 +95,17 @@ index d6f6134..972caa3 100644
 +	}
 +	c.timer = time.AfterFunc(timeout, func() {
 +		c.watchdogMux.Lock()
++		defer c.watchdogMux.Unlock()
 +		if c.done.Load() || c.closed.Load() || c.timer == nil {
-+			c.watchdogMux.Unlock()
 +			return
 +		}
 +		if remaining := timeout - time.Since(c.lastWrite); remaining > 0 {
 +			c.timer.Reset(remaining)
-+			c.watchdogMux.Unlock()
 +			return
 +		}
 +		c.stalled.Store(true)
-+		stalled := c.done.CompareAndSwap(false, true)
-+		if !stalled {
-+			c.stalled.Store(false)
-+		}
-+		c.watchdogMux.Unlock()
-+		if stalled && c.onSuspect != nil {
++		c.done.Store(true)
++		if c.onSuspect != nil {
 +			c.onSuspect(context.DeadlineExceeded, true)
 +		}
 +	})
@@ -118,27 +113,35 @@ index d6f6134..972caa3 100644
 +
 +func (c *fallbackObserverConn) stopWatchdog() {
 +	c.watchdogMux.Lock()
++	c.stopWatchdogLocked()
++	c.watchdogMux.Unlock()
++}
++
++func (c *fallbackObserverConn) stopWatchdogLocked() {
 +	if c.timer != nil {
 +		c.timer.Stop()
 +		c.timer = nil
 +	}
-+	c.watchdogMux.Unlock()
 +}
 +
 +func (c *fallbackObserverConn) markSuccess() {
 +	if c.done.Load() && !c.stalled.Load() {
 +		return
 +	}
++	c.watchdogMux.Lock()
++	defer c.watchdogMux.Unlock()
 +	success := c.done.CompareAndSwap(false, true)
-+	c.stopWatchdog()
-+	c.stalled.Store(false)
-+	if success && c.onSuccess != nil {
++	recovered := c.stalled.Swap(false)
++	c.stopWatchdogLocked()
++	if (success || recovered) && c.onSuccess != nil {
 +		c.onSuccess()
 +	}
 +}
 +
 +func (c *fallbackObserverConn) markError(err error) {
-+	c.stopWatchdog()
++	c.watchdogMux.Lock()
++	defer c.watchdogMux.Unlock()
++	c.stopWatchdogLocked()
 +	if err == nil || c.closed.Load() || isIgnoredFallbackError(err) {
 +		return
 +	}
@@ -256,7 +259,7 @@ index d6f6134..972caa3 100644
  type FallbackOption struct{}
  
  type Fallback struct {
-@@ -21,6 +259,488 @@ type Fallback struct {
+@@ -21,6 +262,489 @@ type Fallback struct {
  	testUrl        string
  	selected       string
  	expectedStatus string
@@ -656,23 +659,24 @@ index d6f6134..972caa3 100644
 +	name := proxy.Name()
 +	peer := f.findProbePeer(name)
 +	go func() {
-+		f.stateMux.Lock()
-+		current := f.proxyStates[name] == owner && f.proxyStateLocked(proxy) == owner
-+		f.stateMux.Unlock()
-+		if !current {
-+			return
-+		}
 +		defer func() {
 +			f.stateMux.Lock()
-+			if st, ok := f.proxyStates[name]; ok && st == owner && f.proxyStateLocked(proxy) == owner {
++			if st, ok := f.proxyStates[name]; ok && st == owner {
 +				st.probing = false
-+				if st.pendingProbe && st.probeTimer == nil && !time.Now().Before(st.cooldownUntil) {
++				if st.pendingProbe && st.probeTimer == nil && !time.Now().Before(st.cooldownUntil) && f.proxyStateLocked(proxy) == owner {
 +					st.pendingProbe = false
 +					f.scheduleProbeLocked(st, proxy, f.effectiveProbeGap(true))
 +				}
 +			}
 +			f.stateMux.Unlock()
 +		}()
++
++		f.stateMux.Lock()
++		current := f.proxyStates[name] == owner && f.proxyStateLocked(proxy) == owner
++		f.stateMux.Unlock()
++		if !current {
++			return
++		}
 +
 +		ctx, cancel := context.WithTimeout(context.Background(), f.probeTimeoutForProxy(proxy))
 +		defer cancel()
@@ -745,7 +749,7 @@ index d6f6134..972caa3 100644
  }
  
  func (f *Fallback) Now() string {
-@@ -28,38 +748,178 @@ func (f *Fallback) Now() string {
+@@ -28,38 +752,178 @@ func (f *Fallback) Now() string {
  	return proxy.Name()
  }
  
@@ -943,7 +947,7 @@ index d6f6134..972caa3 100644
  }
  
  // SupportUDP implements C.ProxyAdapter
-@@ -83,13 +943,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+@@ -83,13 +947,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
  	for _, proxy := range f.GetProxies(false) {
  		all = append(all, proxy.Name())
  	}
@@ -961,7 +965,7 @@ index d6f6134..972caa3 100644
  		"hidden":         f.Hidden(),
  		"icon":           f.Icon(),
  		"emptyFallback":  f.EmptyFallback().Name(),
-@@ -102,25 +965,82 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+@@ -102,25 +969,82 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
  	return proxy
  }
  
@@ -1054,7 +1058,7 @@ index d6f6134..972caa3 100644
  }
  
  func (f *Fallback) Set(name string) error {
-@@ -136,7 +1056,14 @@ func (f *Fallback) Set(name string) error {
+@@ -136,7 +1060,14 @@ func (f *Fallback) Set(name string) error {
  		return errors.New("proxy not exist")
  	}
  
@@ -1069,7 +1073,7 @@ index d6f6134..972caa3 100644
  	if !p.AliveForTestUrl(f.testUrl) {
  		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
  		defer cancel()
-@@ -148,7 +1075,13 @@ func (f *Fallback) Set(name string) error {
+@@ -148,7 +1079,13 @@ func (f *Fallback) Set(name string) error {
  }
  
  func (f *Fallback) ForceSet(name string) {
@@ -1083,7 +1087,7 @@ index d6f6134..972caa3 100644
  }
  
  func (f *Fallback) Providers() []P.ProxyProvider {
-@@ -178,5 +1111,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+@@ -178,5 +1115,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
  		expectedStatus: option.ExpectedStatus,
