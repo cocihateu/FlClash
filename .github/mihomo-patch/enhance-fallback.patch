@@ -2,7 +2,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 index d6f6134..972caa3 100644
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
-@@ -4,15 +4,248 @@ import (
+@@ -4,15 +4,253 @@ import (
  	"context"
  	"encoding/json"
  	"errors"
@@ -77,9 +77,11 @@ index d6f6134..972caa3 100644
 +}
 +
 +func (c *fallbackObserverConn) armWatchdog() {
++	if c.done.Load() || c.closed.Load() {
++		return
++	}
 +	c.watchdogMux.Lock()
 +	defer c.watchdogMux.Unlock()
-+	c.stalled.Store(false)
 +	if c.done.Load() || c.closed.Load() {
 +		return
 +	}
@@ -124,6 +126,9 @@ index d6f6134..972caa3 100644
 +}
 +
 +func (c *fallbackObserverConn) markSuccess() {
++	if c.done.Load() && !c.stalled.Load() {
++		return
++	}
 +	success := c.done.CompareAndSwap(false, true)
 +	c.stopWatchdog()
 +	c.stalled.Store(false)
@@ -251,7 +256,7 @@ index d6f6134..972caa3 100644
  type FallbackOption struct{}
  
  type Fallback struct {
-@@ -21,6 +254,482 @@ type Fallback struct {
+@@ -21,6 +259,488 @@ type Fallback struct {
  	testUrl        string
  	selected       string
  	expectedStatus string
@@ -685,21 +690,27 @@ index d6f6134..972caa3 100644
 +		return
 +	}
 +
-+	now := time.Now()
-+	f.stateMux.Lock()
-+	st := f.proxyStateLocked(proxy)
-+	if st == nil || now.Before(st.cooldownUntil) {
++	for _, current := range f.GetProxies(false) {
++		if current != proxy {
++			continue
++		}
++		now := time.Now()
++		f.stateMux.Lock()
++		if st := f.proxyStates[proxy.Name()]; st != nil && st.proxy == proxy {
++			if now.Before(st.cooldownUntil) {
++				f.stateMux.Unlock()
++				return
++			}
++			st.suspectHosts = nil
++			if st.backoffLevel > 0 && !st.cooldownUntil.IsZero() && now.Sub(st.cooldownUntil) >= f.effectiveRecoveryWindow() {
++				st.backoffLevel--
++				st.cooldownUntil = now
++			}
++		}
 +		f.stateMux.Unlock()
++		f.onDialSuccess()
 +		return
 +	}
-+	st.suspectHosts = nil
-+	if st.backoffLevel > 0 && !st.cooldownUntil.IsZero() && now.Sub(st.cooldownUntil) >= f.effectiveRecoveryWindow() {
-+		st.backoffLevel--
-+		st.cooldownUntil = now
-+	}
-+	f.stateMux.Unlock()
-+
-+	f.onDialSuccess()
 +}
 +
 +func (f *Fallback) wrapObservedConn(c C.Conn, proxy C.Proxy, host string) C.Conn {
@@ -734,7 +745,7 @@ index d6f6134..972caa3 100644
  }
  
  func (f *Fallback) Now() string {
-@@ -28,38 +737,178 @@ func (f *Fallback) Now() string {
+@@ -28,38 +748,178 @@ func (f *Fallback) Now() string {
  	return proxy.Name()
  }
  
@@ -932,7 +943,7 @@ index d6f6134..972caa3 100644
  }
  
  // SupportUDP implements C.ProxyAdapter
-@@ -83,13 +932,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+@@ -83,13 +943,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
  	for _, proxy := range f.GetProxies(false) {
  		all = append(all, proxy.Name())
  	}
@@ -950,7 +961,7 @@ index d6f6134..972caa3 100644
  		"hidden":         f.Hidden(),
  		"icon":           f.Icon(),
  		"emptyFallback":  f.EmptyFallback().Name(),
-@@ -102,25 +954,82 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+@@ -102,25 +965,82 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
  	return proxy
  }
  
@@ -1043,7 +1054,7 @@ index d6f6134..972caa3 100644
  }
  
  func (f *Fallback) Set(name string) error {
-@@ -136,7 +1045,14 @@ func (f *Fallback) Set(name string) error {
+@@ -136,7 +1056,14 @@ func (f *Fallback) Set(name string) error {
  		return errors.New("proxy not exist")
  	}
  
@@ -1058,7 +1069,7 @@ index d6f6134..972caa3 100644
  	if !p.AliveForTestUrl(f.testUrl) {
  		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
  		defer cancel()
-@@ -148,7 +1064,13 @@ func (f *Fallback) Set(name string) error {
+@@ -148,7 +1075,13 @@ func (f *Fallback) Set(name string) error {
  }
  
  func (f *Fallback) ForceSet(name string) {
@@ -1072,7 +1083,7 @@ index d6f6134..972caa3 100644
  }
  
  func (f *Fallback) Providers() []P.ProxyProvider {
-@@ -178,5 +1100,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+@@ -178,5 +1111,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
  		expectedStatus: option.ExpectedStatus,

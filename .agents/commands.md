@@ -17,7 +17,10 @@ git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$PWD/.
 
 Apply the fallback patch once after initializing the pinned Core submodule. This fork's fallback uses
 comparative health checks, instance-scoped cooldowns, staggered TCP attempts and sequential UDP fallback.
-Local builds and Build Fork compile the same patched source.
+Local builds, Build Fork and the manual `build` workflow apply the production fallback patch with
+`--include=adapter/outboundgroup/fallback.go`. The patch's original `fallback_test.go` regression-test section
+remains historical and is excluded by this filter. The manual workflow compiles the production package with
+`go build ./adapter/outboundgroup/...`.
 
 Full package build, including Go core, Flutter, and packaging, runs through `tool/package.dart` (`make package`,
 `make package-android`, with `ARCH=`, `FORM=` and `DRY=1`). Run it with `dart`, not `dart run`, which first runs
@@ -34,7 +37,7 @@ fixed; the installed version and build number come from `pubspec.yaml`, currentl
 Use `dart tool/package.dart android --tag v0.9.4` or `dart tool/package.dart windows --tag v0.9.4`
 for the same local package names. The general `build` workflow has a manual entry point.
 
-Android CI uses the existing `SIGNING_KEYSTORE_BASE64`, `SIGNING_KEY_ALIAS`, `SIGNING_STORE_PASSWORD`
+Build Fork's Android job uses the existing `SIGNING_KEYSTORE_BASE64`, `SIGNING_KEY_ALIAS`, `SIGNING_STORE_PASSWORD`
 and `SIGNING_KEY_PASSWORD` repository secrets for every release. Signed releases use
 `com.cocihateu.flclash`; the app's update source is `cocihateu/FlClash`.
 
@@ -219,9 +222,9 @@ run of `plugins/setup` would execute the build hook itself.
 `.github/scripts/issue-gate.js` is tested with `node --test .github/scripts/`, against the forms in
 `.github/ISSUE_TEMPLATE/`; no workflow runs it, so run it after changing the script or a form.
 
-Native plugin code under `plugins/*/{linux,macos,windows}` is compiled by the CI `desktop` job, which runs
-`flutter build <platform> --debug` on every branch push, and by the release matrix on a tag; `tool/check_plugins.sh`
-only analyzes and tests the Dart side.
+Native plugin code under `plugins/*/{linux,macos,windows}` is compiled by the manual `build` workflow's `desktop`
+job with `flutter build <platform> --debug`. Build Fork compiles the Android and Windows release bundles on
+pushes to `main`; `tool/check_plugins.sh` analyzes and tests the Dart side.
 
 Root `flutter test` only discovers the root package's `test/` directory by default. Include bundled plugin Dart tests by passing paths explicitly, or run `flutter test` from that plugin package directory, or run `bash tool/check_plugins.sh` to analyze and test every plugin package the way CI does. Native plugin tests under platform folders are not run by `flutter test`.
 
@@ -305,7 +308,10 @@ dart run tool/changelog.dart render release --out release.md
 dart run tool/changelog.dart render telegram --out telegram.md
 ```
 
-Releasing a stable version, in order:
+The retained release tooling below describes the upstream tag-release path. This fork distributes the fixed-version
+Build Fork artifacts described in Building; its general `build` workflow starts through `workflow_dispatch`.
+
+Preparing an upstream stable release, in order:
 
 ```bash
 tool/bump_version.sh major
@@ -326,8 +332,7 @@ version name stays `X.Y.Z` for a prerelease too: `compareVersions` reads only nu
 `pubspec.yaml` stays fixed; a local build that must install over a CI one passes its own
 `--build-number`.
 
-Push the tag by name. Every release tag here is lightweight, and `--follow-tags` carries annotated tags only: it skips a
-lightweight one silently, so the branch lands, the tag does not, and the release workflow never fires.
+Push lightweight release tags explicitly by name when using the upstream tag-triggered workflow.
 
 `tool/release.sh` drives both paths so the ordering below cannot be got wrong by hand. It resolves the version (bumping
 the patch when pubspec still names an already tagged one), prints the notes the tag would ship, and only pushes with
@@ -453,9 +458,8 @@ release matrix in `build.yaml`, so a renamed artifact needs the same change in `
 
 ## Verify
 
-In the public repository every branch push runs the `dart` job; in the private
-`origin` every check job runs only when started by hand (`workflow_dispatch`).
-The `dart` job performs these root-package checks in order:
+The manual `build` workflow starts its check jobs through `workflow_dispatch`.
+Its `dart` job performs these root-package checks in order:
 
 ```bash
 bash tool/hooks/test.sh

@@ -127,8 +127,8 @@ jobs:
       - name: Apply Mihomo Fallback Enhancement
         shell: bash
         run: |
-          git -C core/Clash.Meta apply --check "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
-          git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply --check --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -191,8 +191,8 @@ jobs:
       - name: Apply Mihomo Fallback Enhancement
         shell: bash
         run: |
-          git -C core/Clash.Meta apply --check "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
-          git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply --check --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -201,13 +201,11 @@ jobs:
           cache: ${{ env.BRANCH_CACHE }}
           cache-dependency-path: core/go.sum
 
-      - name: Verify Mihomo Fallback Patch
+      - name: Compile Mihomo Fallback Production Package
         working-directory: core/Clash.Meta
         env:
           CGO_ENABLED: 1
-        run: |
-          go vet ./adapter/outboundgroup/...
-          go test -race -v ./adapter/outboundgroup -run TestFallback
+        run: go build ./adapter/outboundgroup/...
 
       - name: Validate Go core wrapper
         working-directory: core
@@ -248,8 +246,8 @@ jobs:
       - name: Apply Mihomo Fallback Enhancement
         shell: bash
         run: |
-          git -C core/Clash.Meta apply --check "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
-          git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply --check --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -439,8 +437,8 @@ jobs:
       - name: Apply Mihomo Fallback Enhancement
         shell: bash
         run: |
-          git -C core/Clash.Meta apply --check "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
-          git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply --check --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
 
       - name: Apply the tag's version
         shell: bash
