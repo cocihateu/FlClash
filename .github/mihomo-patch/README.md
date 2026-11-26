@@ -1,51 +1,66 @@
 # Mihomo fallback policy
 
-ClashMetaForAndroid (CMA) owns the canonical Go implementation in
-`core/src/foss/golang/clash/adapter/outboundgroup/fallback.go`. FlClash carries the
-same observation and failure-policy code in `core/Clash.Meta/adapter/outboundgroup/fallback.go`.
+ClashMetaForAndroid (CMA) owns the canonical Go implementation under
+`core/src/foss/golang/clash`. FlClash carries the same fallback group and provider
+health-check integration under `core/Clash.Meta`.
 Maintain both ports together; preserve FlClash's upstream-specific `UsePosition`
 constructor argument and adapt each patch's hunk offsets to its pinned source.
 SimpleXray implements the equivalent policy through its existing
 Kotlin `FallbackRelayServer`, `GroupRuntimeController`, and `FallbackPolicy`.
 
-Apply both patches to the pinned core in the order shown in the [build instructions](../../.agents/commands.md#building).
-`enhance-fallback.patch` updates the group policy; its `--include=adapter/outboundgroup/fallback.go`
-filter applies to that patch only. Apply `fallback-udp.patch` in full for destination-specific UDP routing.
+The [build instructions](../../.agents/commands.md#building) apply both patches in full to the pinned core:
+first `enhance-fallback.patch` for the group policy and the provider's health-check
+completion callback, then `fallback-udp.patch` for destination-specific UDP routing.
 The manual `build` workflow compiles the group package with `go build ./adapter/outboundgroup/...`.
 
 ## Shared contract
 
-- Each TCP write has its own RTT-based 4–10 second window to complete. For an
-  unanswered exchange, completed writes can extend the response deadline only
-  to two windows from the first unanswered write. Further accepted writes leave
-  the exchange stalled; a real downstream reply clears it.
-- If unsolicited data arrives after an established TCP stream's idle window
-  expires, the first write within one window of that data counts as a likely
-  reply rather than a new request. Its blocked-write deadline still applies.
-  This is a timing heuristic, independent of the payload protocol.
+- Each TCP write has its own RTT-based 4–10 second window to complete. Completed
+  writes can extend the response deadline to at most two windows from the first
+  unanswered write. If that deadline expires while an upload is still making
+  progress, the missing reply is weak evidence: the next connection to that host
+  can use a backup while the current upload continues.
+- When a TCP stream receives a push after its idle window, the first write within one window
+  could be a reply to the push or a new request. Silence after that write gives
+  the same weak routing evidence; the stream stays open on that evidence alone.
+  A blocked write reaching its own deadline, a hard I/O failure, a genuine
+  unanswered request on a quiet stream, or independent confirmation that the
+  serving member failed still follows the usual retirement rules.
 - A TCP response stall, ordinary EOF with a request outstanding (even after an
   earlier reply), a strong I/O error, or UDP silence can change the next route
-  **for the affected host** for 60 seconds. Host ranking reorders only proxy
-  slots; built-ins such as `DIRECT` and `REJECT` keep their positions in the
-  group's ordinary order. Other hosts keep their order. A matching reply clears
-  the member's evidence for that host. If every proxy is affected, their order holds.
+  **for the affected destination** for 60 seconds. Go tracks TCP evidence by
+  host and UDP evidence by host and port. A matching reply clears the member's
+  evidence for that destination; other destinations keep their order. If every
+  proxy is affected, the proxies retain their relative order.
+- Host ranking keeps built-ins such as `DIRECT` and `REJECT` in their ordinary
+  slots. For an affected host, Go's staggered TCP dial can race a real backup
+  past an intervening built-in while the displayed group order stays the same.
 - Group-wide demotion requires three distinct strong-failure hosts in 60 seconds,
   or failure of the configured health URL while a peer succeeds. UDP silence,
   ordinary EOF with a pending request, canceled earlier dials and idle periods are weak
   signals. Strong and weak checks coalesce with minimum gaps of 3 and 15 seconds.
   Instance-owned cooldowns grow through 30, 60, 120, 240 and 300 seconds. In Go,
-  a member in cooldown still records individual host faults; the existing
-  group cooldown keeps its deadline.
+  failures on several UDP ports of one host count as one host toward demotion.
+  The Go group still records individual destination faults for a member in cooldown
+  and keeps the original cooldown deadline.
 - Destinations sharing one local UDP endpoint use separate fallback upstream
   associations. If A keeps receiving replies while B goes silent, A stays on
   its healthy upstream and B can recover on another member independently.
   A reply clears only the exchange for an unambiguously matched endpoint.
+  When Go rebuilds a QUIC association, continuation packets on the same UDP
+  tuple reuse the previously accepted hostname. The matcher runs again and
+  selects the same fallback group under unchanged routing policy. A new QUIC
+  Initial goes through normal hostname sniffing, even on the same tuple.
 - Idle alone triggers one weak health observation per continuous idle interval.
   Once the idle window expires, cleanup can retire the session if its **serving
   member** is confirmed failed or demoted and a two-second sample shows no
-  progress. Ordinary preference changes, recovery and manual selection preserve
-  healthy idle sessions. Go cleanup follows nested wrappers to find the
-  observation for the serving member. Transfers making progress stay connected.
+  progress. The fallback policy preserves healthy idle sessions through recovery
+  and preference changes, including manual selection. CMA Android's explicit
+  `PatchSelector` action separately closes connections whose chain includes the
+  selected group. In Go, a later provider health check can retire an
+  already-idle TCP stream when its serving member fails the group's health URL
+  and an eligible peer for that host is healthy on the same URL. Cleanup follows
+  nested wrappers to find the serving member and samples progress before closing.
 - An established TCP stream on a failed path needs the application to reconnect.
   SimpleXray can replay a first flight of at most 256 KiB before the first reply.
 - The group-wide indicator describes the default candidate. A destination-specific

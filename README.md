@@ -103,10 +103,12 @@ You need [Flutter](https://docs.flutter.dev/get-started/install) 3.50 (release b
 [Go](https://go.dev/dl/) 1.27 and [Rust](https://rustup.rs/) installed through rustup. Each platform builds on its own
 host, except Android, which builds anywhere.
 
+Apply both core patches in full: first the fallback group and provider health-check integration, then destination-specific UDP routing.
+
 ```bash
 git clone --recursive https://github.com/cocihateu/FlClash.git
 cd FlClash
-git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
+git -C core/Clash.Meta apply "$PWD/.github/mihomo-patch/enhance-fallback.patch"
 git -C core/Clash.Meta apply "$PWD/.github/mihomo-patch/fallback-udp.patch"
 flutter pub get
 dart tool/package.dart android   # or windows, macos, linux

@@ -100,10 +100,10 @@ Color marks the one item that differs, never the structure around it.
   `primaryContainer` read as a warning under rose seeds in light and as a heavy slab in dark, muddied the translucent
   marks on it, and cut a grouped run in two.
 - **Multi-select** in edit mode: the circle checkbox is the mark; the row stays at its level.
-- **Proxy groups** have two states in URLTest and Fallback: the check badge marks the proxy traffic goes through, in
-  every group type, and a pin badge (`SelectionBadge.preferred`) marks the preferred proxy (mihomo's `fixed`): filled
-  like the check while the group uses it, tonal while the group has fallen back to another proxy, which carries the
-  check.
+- **Proxy groups** have two states in URLTest and Fallback: the check badge marks the group's current choice
+  (a fallback destination may already use a backup). A pin badge (`SelectionBadge.preferred`) marks the preferred
+  proxy (mihomo's `fixed`): filled like the check while the group uses it, tonal while the group has fallen back
+  to another proxy, which carries the check.
 - **Chosen segment** in a connected button group, a mode switch, or a run of compact choice chips
   (`Card.fillsSelection`): solid `primary` with `onPrimary`, as the dashboard outbound mode does. Only one
   segment per group.

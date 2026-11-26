@@ -44,15 +44,26 @@ diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
 diff --git a/component/nat/table.go b/component/nat/table.go
 --- a/component/nat/table.go
 +++ b/component/nat/table.go
-@@ -6,6 +6,7 @@
+@@ -3,28 +3,121 @@
+ import (
+ 	"net"
+ 	"sync"
++	"time"
  
++	"github.com/metacubex/mihomo/common/lru"
  	"github.com/metacubex/mihomo/common/xsync"
  	C "github.com/metacubex/mihomo/constant"
 +	"github.com/metacubex/mihomo/log"
  )
  
  type Table struct {
-@@ -13,18 +14,95 @@
+-	mapping xsync.Map[string, *entry]
++	mapping      xsync.Map[string, *entry]
++	retiredHosts *lru.LruCache[destination, string]
++}
++
++type destination struct {
++	local, target string
  }
  
  type entry struct {
@@ -95,17 +106,21 @@ diff --git a/component/nat/table.go b/component/nat/table.go
 +			sender = maker()
 +			e.senders[""] = sender
 +			e.active++
- 		}
- 	})
--	return item.PacketSender, loaded
++		}
++	})
 +	return
 +}
 +
-+func (t *Table) SendPacket(key, target string, packet C.PacketAdapter, maker func() C.PacketSender) (created C.PacketSender) {
++func (t *Table) SendPacket(key, target string, packet C.PacketAdapter, maker func(retiredHost string) C.PacketSender) (created C.PacketSender) {
 +	t.withSenders(key, func(e *entry) {
 +		sender := e.senders[target]
 +		if sender == nil {
-+			created = maker()
++			flow := destination{key, target}
++			host, found := t.retiredHosts.Get(flow)
++			if found {
++				t.retiredHosts.Delete(flow)
++			}
++			created = maker(host)
 +			sender = created
 +			e.senders[target] = sender
 +			e.active++
@@ -130,9 +145,12 @@ diff --git a/component/nat/table.go b/component/nat/table.go
 +	return
 +}
 +
-+func (t *Table) RetireDestination(key, target string, sender C.PacketSender) {
++func (t *Table) RetireDestination(key, target string, sender C.PacketSender, sniffHost string) {
 +	t.withSenders(key, func(e *entry) {
 +		if e.senders[target] == sender {
++			if sniffHost != "" {
++				t.retiredHosts.Set(destination{key, target}, sniffHost)
++			}
 +			delete(e.senders, target)
 +		}
 +	})
@@ -149,11 +167,104 @@ diff --git a/component/nat/table.go b/component/nat/table.go
 +			}
 +		} else if e.senders[target] == sender {
 +			delete(e.senders, target)
-+		}
-+	})
+ 		}
+ 	})
+-	return item.PacketSender, loaded
  }
  
  func (t *Table) Delete(key string) {
+@@ -93,7 +186,7 @@
+ 	return sync.NewCond(&sync.Mutex{})
+ }
+ 
+-// New return *Cache
+-func New() *Table {
+-	return &Table{}
++func New(udpTimeout time.Duration) *Table {
++	// The handoff may outlive the last sender and its local sockets.
++	return &Table{retiredHosts: lru.New(lru.WithAge[destination, string](int64(udpTimeout / time.Second)))}
+ }
+diff --git a/component/sniffer/dispatcher.go b/component/sniffer/dispatcher.go
+--- a/component/sniffer/dispatcher.go
++++ b/component/sniffer/dispatcher.go
+@@ -82,7 +82,7 @@
+ // UDPSniff is called when a UDP NAT is created and passed the first initialization packet.
+ // It may return a wrapped packetSender if the sniffer process needs to wait for multiple packets.
+ // This function must be non-blocking, and any blocking operations should be done in the wrapped packetSender.
+-func (sd *Dispatcher) UDPSniff(packet C.PacketAdapter, packetSender C.PacketSender) C.PacketSender {
++func (sd *Dispatcher) UDPSniff(packet C.PacketAdapter, packetSender C.PacketSender, retiredHost string) C.PacketSender {
+ 	metadata := packet.Metadata()
+ 	if sd.shouldOverride(metadata) {
+ 		for _, current := range sd.sniffers {
+@@ -100,7 +100,11 @@
+ 					}
+ 
+ 					if wrapable, ok := current.Sniffer.(sniffer.MultiPacketSniffer); ok {
+-						return wrapable.WrapperSender(packetSender, replaceDomain)
++						sender := wrapable.WrapperSender(packetSender, replaceDomain)
++						if q, ok := sender.(*quicPacketSender); ok {
++							q.retiredHost = retiredHost
++						}
++						return sender
+ 					}
+ 
+ 					host, err := current.SniffData(packet.Data())
+diff --git a/component/sniffer/quic_sniffer.go b/component/sniffer/quic_sniffer.go
+--- a/component/sniffer/quic_sniffer.go
++++ b/component/sniffer/quic_sniffer.go
+@@ -151,6 +151,7 @@
+ 	receivedCryptoData  bitmap
+ 	contiguousCryptoEnd uint64
+ 	result              string
++	retiredHost         string // prior SNI for continuation packets on this tuple
+ 
+ 	replaceDomain sniffer.ReplaceDomain
+ 
+@@ -237,6 +238,9 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	if domain == "" && !firstPacket {
++		domain = q.continuationHost()
++	}
+ 	if domain != "" {
+ 		q.lock.Lock()
+ 		q.result = domain
+@@ -247,10 +251,22 @@
+ 	return nil
+ }
+ 
++func (q *quicPacketSender) continuationHost() string {
++	if q.retiredHost == "" {
++		return ""
++	}
++	q.lock.RLock()
++	defer q.lock.RUnlock()
++	// Once an Initial starts, its own ClientHello supplies the SNI across fragments.
++	if len(q.initialKeys) > 0 {
++		return ""
++	}
++	return q.retiredHost
++}
++
+ // readQUICPacket processes one packet and returns its length in the datagram.
+-// Long-header packets carry an explicit length. A short-header packet is
+-// accepted only after one of them and consumes the remainder because it has
+-// no length field.
++// Long-header packets carry an explicit length. A short header consumes the
++// remainder and can start a datagram when resuming a sniffed association.
+ func (q *quicPacketSender) readQUICPacket(b []byte, coalesced bool) (int, error) {
+ 	buffer := buf.As(b)
+ 
+@@ -260,7 +276,7 @@
+ 	}
+ 
+ 	if typeByte&0x80 == 0 {
+-		if coalesced {
++		if coalesced || (typeByte&0x40 != 0 && q.continuationHost() != "") {
+ 			return len(b), nil
+ 		}
+ 		return 0, errNotQUICInitial
 diff --git a/constant/adapters.go b/constant/adapters.go
 --- a/constant/adapters.go
 +++ b/constant/adapters.go
@@ -296,7 +407,16 @@ diff --git a/tunnel/connection.go b/tunnel/connection.go
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
-@@ -439,65 +439,81 @@
+@@ -41,7 +41,7 @@
+ 	status        = atomic.NewInt32Enum(Suspend)
+ 	udpInit       sync.Once
+ 	udpQueues     []chan C.PacketAdapter
+-	natTable      = nat.New()
++	natTable      = nat.New(udpTimeout)
+ 	rules         []C.Rule
+ 	listeners     = make(map[string]C.InboundListener)
+ 	subRules      map[string][]C.Rule
+@@ -439,65 +439,82 @@
  	}
  
  	key := packet.Key()
@@ -304,14 +424,13 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 -		sender := newPacketSender()
 +	target := metadata.RemoteAddress() // keep the listener's destination through sniffing and DNS mapping
 +	var pending *packetSender
-+	sender := natTable.SendPacket(key, target, packet, func() C.PacketSender {
++	sender := natTable.SendPacket(key, target, packet, func(retiredHost string) C.PacketSender {
 +		pending = newPacketSender()
  		if sniffingEnable && snifferDispatcher.Enable() {
 -			return snifferDispatcher.UDPSniff(packet, sender)
--		}
++			return snifferDispatcher.UDPSniff(packet, pending, retiredHost)
+ 		}
 -		return sender
-+			return snifferDispatcher.UDPSniff(packet, pending)
-+		}
 +		return pending
  	})
 -	if !loaded {
@@ -342,24 +461,6 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 -			})
 -			if err != nil {
 -				return nil, nil, err
--			}
--			logMetadata(metadata, rule, rawPc)
--
--			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
--
--			sender.AddMapping(originMetadata, dialMetadata)
--			oAddrPort := dialMetadata.AddrPort()
--			writeBackProxy := nat.NewWriteBackProxy(packet)
--
--			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
--			return pc, writeBackProxy, nil
--		}
--
--		go func() {
--			pc, proxy, err := dial()
--			if err != nil {
--				sender.Close()
--				natTable.Delete(key)
 +	if sender == nil {
 +		return
 +	}
@@ -373,20 +474,36 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 +			sender.Close()
 +			if pc != nil {
 +				_ = pc.Close()
-+			}
+ 			}
+-			logMetadata(metadata, rule, rawPc)
+-
+-			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
+-
+-			sender.AddMapping(originMetadata, dialMetadata)
+-			oAddrPort := dialMetadata.AddrPort()
+-			writeBackProxy := nat.NewWriteBackProxy(packet)
+-
+-			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
+-			return pc, writeBackProxy, nil
 +		}()
 +		metadata := metadata.Clone()
 +		if err := sender.DoSniff(metadata); err != nil {
 +			log.Warnln("[UDP] DoSniff error: %s", err.Error())
 +			return
 +		}
++		sniffHost := metadata.SniffHost
 +		_ = preHandleMetadata(metadata)
 +		proxy, rule, err := resolveMetadata(metadata)
 +		if err != nil {
 +			log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
 +			return
-+		}
-+
+ 		}
+ 
+-		go func() {
+-			pc, proxy, err := dial()
+-			if err != nil {
+-				sender.Close()
+-				natTable.Delete(key)
 +		dialMetadata := metadata.Pure()
 +		move := func(shared C.PacketSender) { pending.drain(shared.Send) }
 +		if !udpFallbackRoute(proxy, dialMetadata) {
@@ -403,7 +520,7 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 +		if err != nil {
 +			return
 +		}
-+		if !rawPc.OnFallbackClose(func() { natTable.RetireDestination(key, target, sender) }) {
++		if !rawPc.OnFallbackClose(func() { natTable.RetireDestination(key, target, sender, sniffHost) }) {
 +			joined = natTable.Share(key, target, true, move)
 +			if joined {
 +				_ = rawPc.Close()
@@ -411,8 +528,6 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
  			}
 -			sender.Process(pc, proxy)
 -		}()
--	}
--	sender.Send(packet) // nonblocking
 +		}
 +		logMetadata(metadata, rule, rawPc)
 +		pc = statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
@@ -428,7 +543,8 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 +		if p.Type() == C.Fallback {
 +			return true
 +		}
-+	}
+ 	}
+-	sender.Send(packet) // nonblocking
 +	return false
  }
  

@@ -40,7 +40,7 @@ jobs:
       - name: Apply Mihomo Fallback Enhancement
         shell: bash
         run: |
-          git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
           git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/fallback-udp.patch"
 
       - name: Setup Android Signing
@@ -126,7 +126,7 @@ jobs:
       - name: Apply Mihomo Fallback Enhancement
         shell: bash
         run: |
-          git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
           git -C core/Clash.Meta apply "$GITHUB_WORKSPACE/.github/mihomo-patch/fallback-udp.patch"
 
       - name: Setup Go

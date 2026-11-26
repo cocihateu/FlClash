@@ -96,10 +96,12 @@ adb shell am start -a com.follow.clash.action.TOGGLE
 需要 [Flutter](https://docs.flutter.dev/get-started/install) 3.50（正式版构建使用 3.50.0）、[Go](https://go.dev/dl/) 1.27，
 以及通过 rustup 安装的 [Rust](https://rustup.rs/)。桌面端需要在对应系统上构建，Android 在任意系统上都能构建。
 
+依次完整应用两个内核补丁：第一个将提供方的测活结果接入回落组，第二个让 UDP 按目标独立选路。
+
 ```bash
 git clone --recursive https://github.com/cocihateu/FlClash.git
 cd FlClash
-git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
+git -C core/Clash.Meta apply "$PWD/.github/mihomo-patch/enhance-fallback.patch"
 git -C core/Clash.Meta apply "$PWD/.github/mihomo-patch/fallback-udp.patch"
 flutter pub get
 dart tool/package.dart android   # 或 windows、macos、linux

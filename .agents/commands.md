@@ -12,13 +12,13 @@ Update submodules first. The ClashMeta Go core lives in `core/Clash.Meta/`, the 
 
 ```bash
 git submodule update --init --recursive
-git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
+git -C core/Clash.Meta apply "$PWD/.github/mihomo-patch/enhance-fallback.patch"
 git -C core/Clash.Meta apply "$PWD/.github/mihomo-patch/fallback-udp.patch"
 ```
 
-Apply both patches once after initializing the pinned Core submodule. First apply `enhance-fallback.patch` with
-the file filter shown above for comparative health checks, instance-scoped cooldowns and staggered TCP attempts.
-Then apply `fallback-udp.patch` in full so destinations sharing a local UDP endpoint can fail over independently.
+Apply both patches once, in full, after initializing the pinned Core submodule. First apply `enhance-fallback.patch`
+for the group policy and the provider's health-check completion callback. Then apply `fallback-udp.patch`
+so destinations sharing a local UDP endpoint can fail over independently.
 FlClash follows CMA's observation and failure policy while retaining its upstream `UsePosition` constructor
 argument and adapting hunk offsets to the pinned source. The manual `build`
 workflow compiles the production package remotely with `go build ./adapter/outboundgroup/...`.
