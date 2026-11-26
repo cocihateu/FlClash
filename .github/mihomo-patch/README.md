@@ -22,7 +22,8 @@ The manual `build` workflow compiles the group package with `go build ./adapter/
   can use a backup while the current upload continues.
 - When a TCP stream receives a push after its idle window, the first write within one window
   could be a reply to the push or a new request. Silence after that write gives
-  the same weak routing evidence; the stream stays open on that evidence alone.
+  one weak signal for that destination, then the stream returns to idle. Each
+  later push after an idle window gets the same treatment, including repeated heartbeats.
   A blocked write reaching its own deadline, a hard I/O failure, a genuine
   unanswered request on a quiet stream, or independent confirmation that the
   serving member failed still follows the usual retirement rules.
@@ -32,9 +33,11 @@ The manual `build` workflow compiles the group package with `go build ./adapter/
   host and UDP evidence by host and port. A matching reply clears the member's
   evidence for that destination; other destinations keep their order. If every
   proxy is affected, the proxies retain their relative order.
-- Host ranking keeps built-ins such as `DIRECT` and `REJECT` in their ordinary
-  slots. For an affected host, Go's staggered TCP dial can race a real backup
-  past an intervening built-in while the displayed group order stays the same.
+- The displayed order keeps built-ins such as `DIRECT` and `REJECT` in their ordinary
+  slots. Go reserves non-leading built-ins for after the real TCP candidates. It
+  staggers at most three concurrent dials and can reach later candidates within the
+  caller's deadline. UDP tries eligible members sequentially. When a real backup
+  wins over a pending dial, the next connection to the same host can prefer the backup.
 - Group-wide demotion requires three distinct strong-failure hosts in 60 seconds,
   or failure of the configured health URL while a peer succeeds. UDP silence,
   ordinary EOF with a pending request, canceled earlier dials and idle periods are weak
@@ -59,9 +62,12 @@ The manual `build` workflow compiles the group package with `go build ./adapter/
   `PatchSelector` action separately closes connections whose chain includes the
   selected group. In Go, a later provider health check can retire an
   already-idle TCP stream when its serving member fails the group's health URL
-  and an eligible peer for that host is healthy on the same URL. Cleanup follows
-  nested wrappers to find the serving member and samples progress before closing.
+  and an eligible peer for that host is healthy on the same URL. Group cleanup of
+  a stalled TCP upload requires a full quiet window, zero writes in flight, and
+  unchanged progress across the two-second sample.
 - An established TCP stream on a failed path needs the application to reconnect.
   SimpleXray can replay a first flight of at most 256 KiB before the first reply.
+  TCP reports bytes rather than application messages: if a response starts and
+  then stops, silence alone looks like a healthy idle connection.
 - The group-wide indicator describes the default candidate. A destination-specific
   route can already be using a backup while the indicator shows the primary.

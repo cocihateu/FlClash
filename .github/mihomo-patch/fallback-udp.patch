@@ -416,7 +416,7 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
  	rules         []C.Rule
  	listeners     = make(map[string]C.InboundListener)
  	subRules      map[string][]C.Rule
-@@ -439,65 +439,82 @@
+@@ -439,65 +439,88 @@
  	}
  
  	key := packet.Key()
@@ -465,15 +465,15 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 +		return
 +	}
 +	go func() {
-+		var pc C.PacketConn
++		var sharedConn C.PacketConn
 +		joined := false
 +		defer func() {
 +			if !joined {
 +				natTable.RemoveSender(key, target, sender)
 +			}
 +			sender.Close()
-+			if pc != nil {
-+				_ = pc.Close()
++			if sharedConn != nil {
++				_ = sharedConn.Close()
  			}
 -			logMetadata(metadata, rule, rawPc)
 -
@@ -520,7 +520,8 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 +		if err != nil {
 +			return
 +		}
-+		if !rawPc.OnFallbackClose(func() { natTable.RetireDestination(key, target, sender, sniffHost) }) {
++		isolated := rawPc.OnFallbackClose(func() { natTable.RetireDestination(key, target, sender, sniffHost) })
++		if !isolated {
 +			joined = natTable.Share(key, target, true, move)
 +			if joined {
 +				_ = rawPc.Close()
@@ -530,7 +531,12 @@ diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 -		}()
 +		}
 +		logMetadata(metadata, rule, rawPc)
-+		pc = statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
++		pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
++		if isolated {
++			defer pc.Close() // Retire the destination before RemoveSender releases ownership.
++		} else {
++			sharedConn = pc
++		}
 +		sender.AddMapping(packet.Metadata(), dialMetadata)
 +		writeBack := nat.NewWriteBackProxy(packet)
 +		go sender.Process(pc, writeBack)

@@ -1,7 +1,7 @@
 diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.go
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
-@@ -4,15 +4,711 @@
+@@ -4,15 +4,723 @@
  	"context"
  	"encoding/json"
  	"errors"
@@ -27,7 +27,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +const (
 +	fallbackMinStaggerDelay    = 1500 * time.Millisecond
 +	fallbackMaxStaggerDelay    = 3000 * time.Millisecond
-+	fallbackMaxDialAttempts    = 3
++	fallbackMaxConcurrentDials = 3
 +	fallbackMinStallThreshold  = 4 * time.Second
 +	fallbackMaxStallThreshold  = 10 * time.Second
 +	fallbackProbeTimeout       = 3 * time.Second
@@ -204,6 +204,11 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +				}
 +			}
 +			if !now.Before(x.due) {
++				if x.possibleReply {
++					delete(o.pending, key)
++					o.markIdleLocked(true)
++					continue
++				}
 +				x.stalled, x.awaiting = true, false
 +				o.group.reportEvidence(o.proxy, x.host, o.strongTimeout && !o.routeOnlyLocked(x, now), true)
 +				o.scheduleRetirementLocked(key, x)
@@ -214,17 +219,20 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +	if !o.idleDue.IsZero() {
 +		if !now.Before(o.idleDue) {
-+			o.idleObserved = true
-+			o.idleDue = time.Time{}
-+			o.group.reportEvidence(o.proxy, o.host, false, false)
-+			if o.group.memberDemoted(o.proxy) {
-+				o.idleFailed = true
-+				go o.retireIdle(o.lastProgress)
-+			}
++			o.markIdleLocked(false)
 +		}
 +		o.armLocked(o.idleDue)
 +	}
 +	o.mux.Unlock()
++}
++
++func (o *fallbackObservation) markIdleLocked(steerHost bool) {
++	o.idleObserved, o.idleDue = true, time.Time{}
++	o.group.reportEvidence(o.proxy, o.host, false, steerHost)
++	if o.group.memberDemoted(o.proxy) {
++		o.idleFailed = true
++		go o.retireIdle(o.lastProgress)
++	}
 +}
 +
 +func (o *fallbackObservation) retireIdle(progress time.Time) {
@@ -234,9 +242,9 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +}
 +
-+// A possible reply to a push and an upload still making progress can steer the next dial.
++// An upload still making progress can steer the next dial while keeping its stream.
 +func (o *fallbackObservation) routeOnlyLocked(x *fallbackExchange, now time.Time) bool {
-+	return o.strongTimeout && (x.possibleReply || len(o.writes) > 0 ||
++	return o.strongTimeout && (len(o.writes) > 0 ||
 +		(x.repeatedWrite && now.Sub(x.lastWrite) < o.stallTimeout))
 +}
 +
@@ -332,7 +340,11 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		}
 +	}
 +	now := time.Now()
-+	if o.strongTimeout && o.responded && x == nil && (o.idleObserved || (!o.idleDue.IsZero() && !now.Before(o.idleDue))) {
++	idlePush := x == nil && (o.idleObserved || (!o.idleDue.IsZero() && !now.Before(o.idleDue)))
++	if x != nil && x.possibleReply && !now.Before(x.due) {
++		idlePush = true
++	}
++	if o.strongTimeout && o.responded && idlePush {
 +		o.replyUntil = now.Add(o.stallTimeout)
 +	}
 +	o.responded, o.lastProgress = true, now
@@ -408,15 +420,15 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +}
 +
 +func (o *fallbackObservation) stalledLocked() bool {
-+	if o.closed {
++	if o.closed || len(o.writes) > 0 || (o.strongTimeout && time.Since(o.lastProgress) < o.stallTimeout) {
 +		return false
 +	}
 +	for _, x := range o.pending {
-+		if x.stalled && (o.strongTimeout || len(o.writes) == 0) {
++		if x.stalled {
 +			return true
 +		}
 +	}
-+	return o.idleFailed && len(o.writes) == 0
++	return o.idleFailed
 +}
 +
 +func (o *fallbackObservation) claimStall(progress time.Time) bool {
@@ -714,7 +726,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  type FallbackOption struct{}
  
  type Fallback struct {
-@@ -21,6 +717,519 @@
+@@ -21,6 +729,519 @@
  	testUrl        string
  	selected       string
  	expectedStatus string
@@ -1234,16 +1246,43 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  func (f *Fallback) Now() string {
-@@ -28,38 +1237,203 @@
+@@ -28,38 +1249,213 @@
  	return proxy.Name()
  }
  
 +type fallbackDialResult struct {
-+	idx      int
-+	proxy    C.Proxy
-+	conn     C.Conn
-+	err      error
-+	metadata *C.Metadata
++	idx           int
++	proxy         C.Proxy
++	conn          C.Conn
++	err           error
++	metadata      *C.Metadata
++	budgetExpired bool
++}
++
++func (f *Fallback) reportDialFailures(host string, failures []fallbackDialResult) {
++	for _, failed := range failures {
++		strong := !failed.budgetExpired && isStrongFallbackError(failed.err)
++		f.reportEvidence(failed.proxy, host, strong, strong || failed.budgetExpired)
++	}
++}
++
++func fallbackRealCount(candidates []C.Proxy) int {
++	count := 0
++	for _, proxy := range candidates {
++		if !isSkippableAdapter(proxy.Type()) {
++			count++
++		}
++	}
++	return count
++}
++
++func fallbackDialBudget(ctx context.Context, limit time.Duration, remaining, slots int) time.Duration {
++	if deadline, ok := ctx.Deadline(); ok {
++		if share := time.Until(deadline) / time.Duration(remaining) * time.Duration(slots); share < limit {
++			return share
++		}
++	}
++	return limit
 +}
 +
  // DialContext implements C.ProxyAdapter
@@ -1254,20 +1293,17 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 -		c.AppendToChains(f)
 -	} else {
 -		f.onDialFailed(proxy.Type(), err, f.healthCheck)
-+	host := metadataHostKey(metadata)
-+	candidates, ordinary := f.rankCandidates(true, host, true)
-+	maxAttempts := len(candidates)
-+	if maxAttempts > fallbackMaxDialAttempts {
-+		maxAttempts = fallbackMaxDialAttempts
- 	}
- 
+-	}
+-
 -	if N.NeedHandshake(c) {
 -		c = callback.NewFirstWriteCallBackConn(c, func(err error) {
 -			if err == nil {
 -				f.onDialSuccess()
 -			} else {
 -				f.onDialFailed(proxy.Type(), err, f.healthCheck)
-+	if maxAttempts == 1 {
++	host := metadataHostKey(metadata)
++	candidates, ordinary := f.rankCandidates(true, host, true)
++	if len(candidates) == 1 {
 +		proxy := candidates[0]
 +		c, err := proxy.DialContext(ctx, metadata)
 +		if err == nil && c != nil {
@@ -1280,66 +1316,86 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +
 +	dialCtx, cancelAll := context.WithCancel(ctx)
-+	resCh := make(chan fallbackDialResult, maxAttempts)
-+
++	resCh := make(chan fallbackDialResult, fallbackMaxConcurrentDials)
++	pending := make(map[int]C.Proxy, fallbackMaxConcurrentDials)
++	remainingReal := fallbackRealCount(candidates)
 +	launched := 0
-+	completed := 0
++	var stagger *time.Timer
++	var tick <-chan time.Time
 +	launchNext := func() {
-+		if launched >= maxAttempts {
-+			return
-+		}
 +		idx := launched
 +		proxy := candidates[idx]
 +		launched++
++		pending[idx] = proxy
++		if !isSkippableAdapter(proxy.Type()) {
++			remainingReal--
++		}
++		remaining := remainingReal + 1
++		// Concurrent attempts can share overlapping slots; each reserve runs alone.
++		slots := ordinary - idx
++		if slots > fallbackMaxConcurrentDials {
++			slots = fallbackMaxConcurrentDials
++		} else if slots < 1 {
++			slots = 1
++		}
++		attemptCtx := dialCtx
++		var cancel context.CancelFunc
++		if remaining > slots {
++			attemptCtx, cancel = context.WithTimeout(dialCtx, fallbackDialBudget(dialCtx, f.stallTimeoutForProxy(proxy), remaining, slots))
++		}
 +		dialMetadata := metadata.Clone()
 +		go func() {
-+			c, err := proxy.DialContext(dialCtx, dialMetadata)
-+			resCh <- fallbackDialResult{idx: idx, proxy: proxy, conn: c, err: err, metadata: dialMetadata}
++			c, err := proxy.DialContext(attemptCtx, dialMetadata)
++			expired := cancel != nil && attemptCtx.Err() == context.DeadlineExceeded
++			if cancel != nil {
++				cancel()
++			}
++			resCh <- fallbackDialResult{idx: idx, proxy: proxy, conn: c, err: err, metadata: dialMetadata, budgetExpired: expired}
 +		}()
++		if stagger != nil {
++			stagger.Stop()
++			tick = nil
++		}
++		if launched < ordinary && len(pending) < fallbackMaxConcurrentDials {
++			stagger = time.NewTimer(fallbackDialBudget(dialCtx, f.staggerDelayForProxy(proxy), remaining, 1))
++			tick = stagger.C
++		}
 +	}
 +
 +	launchNext()
++	defer func() {
++		cancelAll()
++		if stagger != nil {
++			stagger.Stop()
++		}
++		if n := len(pending); n > 0 {
++			go func() {
++				for i := 0; i < n; i++ {
++					if r := <-resCh; r.conn != nil {
++						_ = r.conn.Close()
++					}
++				}
++			}()
++		}
++	}()
 +
-+	stagger := time.NewTimer(f.staggerDelayForProxy(candidates[0]))
-+	defer func() { stagger.Stop() }()
-+
-+	finished := make([]bool, maxAttempts)
 +	var failedResults []fallbackDialResult
 +	var lastErr error
-+
-+	for completed < maxAttempts {
-+		var timerCh <-chan time.Time
-+		if launched < maxAttempts && (launched < ordinary || completed == launched) {
-+			timerCh = stagger.C
-+		}
-+
++	for len(pending) > 0 {
 +		select {
 +		case res := <-resCh:
-+			completed++
-+			finished[res.idx] = true
++			delete(pending, res.idx)
 +			if res.err == nil && res.conn != nil {
 +				cancelAll()
 +				*metadata = *res.metadata
-+				remaining := launched - completed
-+				if remaining > 0 {
-+					go func(n int) {
-+						for i := 0; i < n; i++ {
-+							r := <-resCh
-+							if r.conn != nil {
-+								_ = r.conn.Close()
-+							}
++				if !isSkippableAdapter(res.proxy.Type()) {
++					for idx, p := range pending {
++						if idx < res.idx {
++							f.reportEvidence(p, host, false, true)
 +						}
-+					}(remaining)
-+				}
-+
-+				for idx := 0; idx < res.idx; idx++ {
-+					if !finished[idx] {
-+						f.reportSuspect(candidates[idx], host, false)
 +					}
 +				}
-+				for _, failed := range failedResults {
-+					f.reportSuspect(failed.proxy, host, isStrongFallbackError(failed.err))
-+				}
++				f.reportDialFailures(host, failedResults)
 +				return f.wrapObservedConn(res.conn, res.proxy, host), nil
 +			}
 +
@@ -1348,35 +1404,16 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +				failedResults = append(failedResults, res)
  			}
 -		})
-+			if launched < maxAttempts && (launched < ordinary || completed == launched) {
-+				nextProxy := candidates[launched]
++			if ctx.Err() == nil && launched < len(candidates) && (launched < ordinary || len(pending) == 0) {
 +				launchNext()
-+				if launched < maxAttempts {
-+					stagger.Stop()
-+					stagger = time.NewTimer(f.staggerDelayForProxy(nextProxy))
-+				}
 +			}
 +
-+		case <-timerCh:
-+			nextProxy := candidates[launched]
-+			launchNext()
-+			if launched < maxAttempts {
-+				stagger.Reset(f.staggerDelayForProxy(nextProxy))
++		case <-tick:
++			if ctx.Err() == nil {
++				launchNext()
 +			}
 +
 +		case <-ctx.Done():
-+			cancelAll()
-+			remaining := launched - completed
-+			if remaining > 0 {
-+				go func(n int) {
-+					for i := 0; i < n; i++ {
-+						r := <-resCh
-+						if r.conn != nil {
-+							_ = r.conn.Close()
-+						}
-+					}
-+				}(remaining)
-+			}
 +			if lastErr != nil {
 +				return nil, lastErr
 +			}
@@ -1385,7 +1422,6 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  	}
  
 -	return c, err
-+	cancelAll()
 +	// A shared dial failure refreshes provider health while retaining cooldown state.
 +	if ctx.Err() == nil && lastErr != nil && !isIgnoredFallbackError(lastErr) {
 +		f.onDialFailed(candidates[0].Type(), lastErr, f.healthCheck)
@@ -1411,37 +1447,26 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 -	return pc, err
 +	var failures []fallbackDialResult
 +	lastErr := C.ErrNotSupport
-+	attempts := 0
++	remainingReal := fallbackRealCount(eligible)
 +	for i, proxy := range eligible {
-+		if attempts >= fallbackMaxDialAttempts {
-+			break
++		if !isSkippableAdapter(proxy.Type()) {
++			remainingReal--
 +		}
-+		remaining := len(eligible) - i
-+		if limit := fallbackMaxDialAttempts - attempts; remaining > limit {
-+			remaining = limit
-+		}
-+		attempts++
 +		attemptCtx := ctx
 +		var cancel context.CancelFunc
-+		if remaining > 1 {
-+			budget := f.stallTimeoutForProxy(proxy)
-+			if deadline, ok := ctx.Deadline(); ok {
-+				if share := time.Until(deadline) / time.Duration(remaining); share < budget {
-+					budget = share
-+				}
-+			}
++		if i+1 < len(eligible) {
++			budget := fallbackDialBudget(ctx, f.stallTimeoutForProxy(proxy), remainingReal+1, 1)
 +			attemptCtx, cancel = context.WithTimeout(ctx, budget)
 +		}
 +		attemptMetadata := metadata.Clone()
 +		pc, err := proxy.ListenPacketContext(attemptCtx, attemptMetadata)
++		expired := cancel != nil && attemptCtx.Err() == context.DeadlineExceeded
 +		if cancel != nil {
 +			cancel()
 +		}
 +		if err == nil {
 +			*metadata = *attemptMetadata
-+			for _, failed := range failures {
-+				f.reportSuspect(failed.proxy, host, isStrongFallbackError(failed.err))
-+			}
++			f.reportDialFailures(host, failures)
 +			return f.wrapObservedPacketConn(pc, proxy, metadata, host), nil
 +		}
 +		lastErr = err
@@ -1449,16 +1474,15 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +			return nil, err
 +		}
 +		if errors.Is(err, C.ErrNotSupport) {
-+			attempts--
 +			continue
 +		}
-+		failures = append(failures, fallbackDialResult{proxy: proxy, err: err})
++		failures = append(failures, fallbackDialResult{proxy: proxy, err: err, budgetExpired: expired})
 +	}
 +	return nil, lastErr
  }
  
  // SupportUDP implements C.ProxyAdapter
-@@ -67,14 +1441,17 @@
+@@ -67,14 +1463,17 @@
  	if f.disableUDP {
  		return false
  	}
@@ -1480,7 +1504,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  // MarshalJSON implements C.ProxyAdapter
-@@ -83,13 +1460,16 @@
+@@ -83,13 +1482,16 @@
  	for _, proxy := range f.GetProxies(false) {
  		all = append(all, proxy.Name())
  	}
@@ -1498,7 +1522,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  		"hidden":         f.Hidden(),
  		"icon":           f.Icon(),
  		"emptyFallback":  f.EmptyFallback().Name(),
-@@ -98,29 +1478,169 @@
+@@ -98,29 +1500,173 @@
  
  // Unwrap implements C.ProxyAdapter
  func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
@@ -1595,7 +1619,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	candidates = append(candidates, aliveDemoted...)
 +	candidates = append(candidates, otherHealthy...)
 +	candidates = append(candidates, otherDemoted...)
-+	ordinary := len(candidates)
++	hasUnmarked := false
 +	if host != "" {
 +		hasFailure := false
 +		for _, proxy := range candidates {
@@ -1621,27 +1645,31 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +				}
 +			}
 +			sort.SliceStable(members, func(i, j int) bool { return rank(members[i]) < rank(members[j]) })
-+			hasUnmarked := len(members) > 0 && rank(members[0]) < 2
++			hasUnmarked = len(members) > 0 && rank(members[0]) < 2
 +			for i, p := range candidates {
 +				if !isSkippableAdapter(p.Type()) {
 +					candidates[i], members = members[0], members[1:]
 +				}
 +			}
-+			if dial {
-+				// Race real alternatives first; keep built-ins in the displayed order and in reserve for dialing.
-+				ready := candidates[:0]
-+				var reserve []C.Proxy
-+				for i, p := range candidates {
-+					if i > 0 && (isSkippableAdapter(p.Type()) || (hasUnmarked && rank(p) == 2)) {
-+						reserve = append(reserve, p)
-+					} else {
-+						ready = append(ready, p)
-+					}
-+				}
-+				ordinary = len(ready)
-+				candidates = append(ready, reserve...)
++		}
++	}
++	ordinary := len(candidates)
++	if dial {
++		// The displayed leader dials first; later built-ins follow even the host-affected real proxies.
++		ready := candidates[:0]
++		var reserve, builtins []C.Proxy
++		for i, p := range candidates {
++			if i > 0 && isSkippableAdapter(p.Type()) {
++				builtins = append(builtins, p)
++			} else if i > 0 && hasUnmarked && f.affectedLocked(p, host, now) {
++				reserve = append(reserve, p)
++			} else {
++				ready = append(ready, p)
  			}
  		}
++		ordinary = len(ready)
++		candidates = append(ready, reserve...)
++		candidates = append(candidates, builtins...)
  	}
 +	f.stateMux.Unlock()
 +	return candidates, ordinary
@@ -1680,7 +1708,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  func (f *Fallback) Set(name string) error {
-@@ -136,7 +1656,14 @@
+@@ -136,7 +1682,14 @@
  		return errors.New("proxy not exist")
  	}
  
@@ -1695,7 +1723,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  	if !p.AliveForTestUrl(f.testUrl) {
  		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
  		defer cancel()
-@@ -148,7 +1675,13 @@
+@@ -148,7 +1701,13 @@
  }
  
  func (f *Fallback) ForceSet(name string) {
@@ -1709,7 +1737,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  func (f *Fallback) Providers() []P.ProxyProvider {
-@@ -178,5 +1711,6 @@
+@@ -178,5 +1737,6 @@
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
  		expectedStatus: option.ExpectedStatus,
