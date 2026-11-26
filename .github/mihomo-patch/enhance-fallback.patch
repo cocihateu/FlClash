@@ -1,12 +1,13 @@
 diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.go
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
-@@ -4,15 +4,472 @@ import (
+@@ -4,15 +4,590 @@ import (
  	"context"
  	"encoding/json"
  	"errors"
 +	"io"
 +	"net"
++	"sort"
 +	"strings"
 +	"sync"
  	"time"
@@ -42,10 +43,13 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +type proxyFailState struct {
 +	proxy         C.Proxy
 +	suspectHosts  map[string]time.Time
++	affectedHosts map[string]time.Time
 +	cooldownUntil time.Time
 +	backoffLevel  int
 +	probing       bool
 +	pendingProbe  bool
++	pendingStrong bool
++	probeDue      time.Time
 +	lastProbe     time.Time
 +	probeTimer    *time.Timer
 +	probeGen      uint64
@@ -58,6 +62,22 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +	st.probeGen++
 +	st.pendingProbe = false
++	st.pendingStrong = false
++	st.probeDue = time.Time{}
++}
++
++type fallbackExchange struct {
++	host     string
++	due      time.Time
++	stalled  bool
++	awaiting bool
++}
++
++type fallbackWrite struct {
++	key      string
++	host     string
++	started  time.Time
++	answered bool
 +}
 +
 +type fallbackObservation struct {
@@ -69,98 +89,161 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	closeTransport func() error
 +	mux            sync.Mutex
 +	timer          *time.Timer
-+	waiting        bool
++	pending        map[string]*fallbackExchange
++	addresses      map[string]string
++	writes         map[*fallbackWrite]struct{}
++	idleDue        time.Time
++	armedFor       time.Time
++	lastProgress   time.Time
++	lastSuccess    time.Time
++	cleanupPending bool
++	idleObserved   bool
++	idleFailed     bool
 +	responded      bool
-+	reported       bool
 +	closed         bool
-+	writing        int
-+	writeResponded bool
-+	idle           bool
-+	lastRead       time.Time
 +	receiveEnded   bool
 +}
 +
-+func (o *fallbackObservation) beginWrite(host string) {
++func (o *fallbackObservation) beginWrite(key string) *fallbackWrite {
 +	o.mux.Lock()
 +	defer o.mux.Unlock()
 +	if o.closed {
-+		return
++		return nil
 +	}
-+	o.writing++
-+	o.writeResponded = false
-+	if !o.waiting && host != "" {
-+		o.host = host
++	host := o.host
++	if key != "" {
++		host = o.packetHost(key)
 +	}
-+	o.armWatchdogLocked()
++	now := time.Now()
++	w := &fallbackWrite{key: key, host: host, started: now}
++	o.writes[w] = struct{}{}
++	if !o.receiveEnded {
++		if x := o.pending[key]; x == nil {
++			o.pending[key] = &fallbackExchange{host: host, due: now.Add(o.stallTimeout), awaiting: true}
++		} else if !x.awaiting {
++			x.awaiting, x.due = true, now.Add(o.stallTimeout)
++			if o.strongTimeout {
++				x.stalled = false
++			}
++		}
++	}
++	o.idleDue = time.Time{}
++	o.idleObserved = false
++	o.idleFailed = false
++	o.armLocked(w.started.Add(o.stallTimeout))
++	return w
 +}
 +
-+func (o *fallbackObservation) armWatchdogLocked() {
-+	if o.waiting {
++func (o *fallbackObservation) armLocked(due time.Time) {
++	if o.closed || due.IsZero() || (o.timer != nil && !due.Before(o.armedFor)) {
 +		return
 +	}
 +	o.stopTimerLocked()
-+	o.idle = false
-+	o.waiting = true
-+	o.reported = false
-+	o.startTimerLocked()
++	var t *time.Timer
++	t = time.AfterFunc(time.Until(due), func() {
++		o.mux.Lock()
++		o.expireLocked(t)
++	})
++	o.timer, o.armedFor = t, due
 +}
 +
-+func (o *fallbackObservation) armIdleLocked() {
-+	if o.closed || o.receiveEnded {
++func (o *fallbackObservation) expireLocked(t *time.Timer) {
++	if o.closed || o.timer != t {
++		o.mux.Unlock()
 +		return
 +	}
-+	o.idle = true
-+	o.lastRead = time.Now()
-+	if o.timer == nil {
-+		o.startTimerLocked()
-+	}
-+}
-+
-+func (o *fallbackObservation) startTimerLocked() {
-+	timeout := o.stallTimeout
-+	if timeout <= 0 {
-+		timeout = fallbackMinStallThreshold
-+	}
-+	var timer *time.Timer
-+	timer = time.AfterFunc(timeout, func() {
-+		o.mux.Lock()
-+		if o.closed || o.timer != timer {
++	o.timer = nil
++	now := time.Now()
++	for w := range o.writes {
++		due := w.started.Add(o.stallTimeout)
++		if !now.Before(due) {
++			o.group.reportEvidence(o.proxy, w.host, o.strongTimeout, true)
++			o.closed = true
++			o.stopTimerLocked()
 +			o.mux.Unlock()
++			_ = o.closeTransport()
 +			return
 +		}
-+		if o.idle {
-+			if remaining := timeout - time.Since(o.lastRead); remaining > 0 {
-+				timer.Reset(remaining)
-+				o.mux.Unlock()
-+				return
++		o.armLocked(due)
++	}
++	for key, x := range o.pending {
++		if !now.Before(x.due) {
++			// A fresh write has its own deadline; let actual upload progress settle first.
++			for w := range o.writes {
++				if w.key == key && !w.answered {
++					x.due = w.started.Add(o.stallTimeout)
++					break
++				}
++			}
++			if !now.Before(x.due) {
++				x.stalled, x.awaiting = true, false
++				o.group.reportEvidence(o.proxy, x.host, o.strongTimeout, true)
++				if !o.cleanupPending && o.group.alternateFor(o.proxy, x.host, !o.strongTimeout) {
++					o.cleanupPending = true
++					go o.retireStalled(key, x, o.lastProgress)
++				}
++				x.due = now.Add(o.group.effectiveProbeGap(false))
 +			}
 +		}
-+		o.timer = nil
-+		o.reported = true
-+		o.group.reportSuspect(o.proxy, o.host, o.strongTimeout && !o.idle)
-+		closeWrite := o.writing > 0
-+		if closeWrite {
-+			o.closed = true
-+		}
-+		o.mux.Unlock()
-+		if closeWrite {
-+			_ = o.closeTransport()
-+		}
-+	})
-+	o.timer = timer
-+}
-+
-+func (o *fallbackObservation) endWrite() {
-+	o.mux.Lock()
-+	if o.writing > 0 {
-+		o.writing--
++		o.armLocked(x.due)
 +	}
-+	if o.writing == 0 && (o.writeResponded || o.receiveEnded) {
-+		o.stopTimerLocked()
-+		o.waiting = false
-+		o.armIdleLocked()
++	if !o.idleDue.IsZero() {
++		if !now.Before(o.idleDue) {
++			o.idleObserved = true
++			o.group.reportEvidence(o.proxy, o.host, false, false)
++			o.idleDue = now.Add(o.group.effectiveProbeGap(false))
++		}
++		o.armLocked(o.idleDue)
 +	}
 +	o.mux.Unlock()
++}
++
++func (o *fallbackObservation) retireStalled(key string, x *fallbackExchange, progress time.Time) {
++	time.Sleep(o.group.effectiveCloseSampleDelay())
++	o.mux.Lock()
++	o.cleanupPending = false
++	retire := !o.closed && len(o.writes) == 0 && o.pending[key] == x && x.stalled && o.lastProgress == progress && o.group.alternateFor(o.proxy, x.host, !o.strongTimeout)
++	if retire {
++		o.closed = true
++		o.stopTimerLocked()
++	}
++	o.mux.Unlock()
++	if retire {
++		_ = o.closeTransport()
++	}
++}
++
++func (o *fallbackObservation) endWrite(w *fallbackWrite, sent bool, err error) {
++	if w == nil {
++		return
++	}
++	o.mux.Lock()
++	defer o.mux.Unlock()
++	delete(o.writes, w)
++	if o.closed {
++		return
++	}
++	if err != nil {
++		delete(o.pending, w.key)
++		if !isIgnoredFallbackError(err) {
++			o.group.reportSuspect(o.proxy, w.host, isStrongFallbackError(err))
++		}
++	}
++	if sent {
++		now := time.Now()
++		if o.strongTimeout || o.pending[w.key] == nil || !o.pending[w.key].stalled {
++			o.lastProgress = now
++		}
++		o.idleObserved = false
++		o.idleFailed = false
++		if x := o.pending[w.key]; x != nil && !w.answered && o.strongTimeout {
++			x.due, x.stalled = now.Add(o.stallTimeout), false
++		}
++	}
++	if err == nil && len(o.pending) == 0 && o.responded && !o.receiveEnded && o.idleDue.IsZero() {
++		o.idleDue = time.Now().Add(o.stallTimeout)
++		o.armLocked(o.idleDue)
++	}
 +}
 +
 +func (o *fallbackObservation) stopTimerLocked() {
@@ -170,75 +253,60 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +}
 +
-+func (o *fallbackObservation) markSuccess(host string) {
++func (o *fallbackObservation) markSuccess(key string) {
 +	o.mux.Lock()
 +	defer o.mux.Unlock()
 +	if o.closed {
 +		return
 +	}
-+	if host == "" {
-+		host = o.host
++	host := o.host
++	if key != "" {
++		host = o.packetHost(key)
 +	}
-+	if o.waiting && host != o.host {
++	x := o.pending[key]
++	if x != nil {
++		host = x.host
++		delete(o.pending, key)
++	}
++	for w := range o.writes {
++		if w.key == key {
++			w.answered = true
++		}
++	}
++	now := time.Now()
++	o.responded, o.lastProgress = true, now
++	o.idleObserved = false
++	o.idleFailed = false
++	if x != nil || now.Sub(o.lastSuccess) >= o.stallTimeout {
 +		o.group.recordProxySuccess(o.proxy, host)
-+		return
++		o.lastSuccess = now
 +	}
-+	o.host = host
-+	if !o.idle {
-+		o.stopTimerLocked()
-+	}
-+	o.waiting = false
-+	o.responded = true
-+	o.reported = false
-+	o.writeResponded = o.writing > 0
-+	o.group.recordProxySuccess(o.proxy, host)
-+	if o.writing > 0 {
-+		o.armWatchdogLocked()
-+	} else {
-+		o.armIdleLocked()
++	if len(o.pending) == 0 && !o.receiveEnded {
++		o.idleDue = now.Add(o.stallTimeout)
++		o.armLocked(o.idleDue)
 +	}
 +}
 +
 +func (o *fallbackObservation) markError(err error) {
 +	o.mux.Lock()
 +	defer o.mux.Unlock()
-+	o.markErrorLocked(err)
-+}
-+
-+func (o *fallbackObservation) markErrorLocked(err error) {
++	if o.closed || isIgnoredFallbackError(err) {
++		return
++	}
 +	if errors.Is(err, io.EOF) {
 +		o.receiveEnded = true
-+		if o.writing > 0 {
-+			if !o.closed && !o.responded && !o.reported {
-+				o.reported = true
-+				o.group.reportSuspect(o.proxy, o.host, false)
-+			}
-+			return
-+		}
 +	}
-+	o.stopTimerLocked()
-+	o.waiting = false
-+	if err == nil || o.closed || isIgnoredFallbackError(err) || (o.responded && errors.Is(err, io.EOF)) {
-+		return
++	if !o.responded || !errors.Is(err, io.EOF) {
++		strong := isStrongFallbackError(err)
++		o.group.reportEvidence(o.proxy, o.host, strong, strong || (o.strongTimeout && len(o.pending) > 0 && errors.Is(err, io.EOF)))
 +	}
-+	strong := isStrongFallbackError(err)
-+	if strong || !o.reported {
-+		o.reported = true
-+		o.group.reportSuspect(o.proxy, o.host, strong)
++	o.idleDue = time.Time{}
++	for key := range o.pending {
++		delete(o.pending, key)
 +	}
-+}
-+
-+func (o *fallbackObservation) markPacketWriteError(err error, host string) {
-+	o.mux.Lock()
-+	defer o.mux.Unlock()
-+	if o.waiting && host != o.host {
-+		if !o.closed && !isIgnoredFallbackError(err) {
-+			o.group.reportSuspect(o.proxy, host, isStrongFallbackError(err))
-+		}
-+		return
++	if len(o.writes) == 0 {
++		o.stopTimerLocked()
 +	}
-+	o.host = host
-+	o.markErrorLocked(err)
 +}
 +
 +func (o *fallbackObservation) markPacketReadError(err error) {
@@ -249,13 +317,14 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +	o.mux.Lock()
 +	defer o.mux.Unlock()
-+	if !o.closed && o.waiting && !o.reported {
-+		o.reported = true
-+		o.group.reportSuspect(o.proxy, o.host, false)
++	if o.closed {
++		return
 +	}
-+	if o.writing == 0 {
-+		o.stopTimerLocked()
-+		o.waiting = false
++	for _, x := range o.pending {
++		if !x.stalled {
++			x.stalled, x.awaiting = true, false
++			o.group.reportEvidence(o.proxy, x.host, false, true)
++		}
 +	}
 +}
 +
@@ -266,10 +335,36 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	o.mux.Unlock()
 +}
 +
-+func (o *fallbackObservation) isClosed() bool {
++func (o *fallbackObservation) sampleStall(failedIdle bool) (time.Time, bool) {
 +	o.mux.Lock()
 +	defer o.mux.Unlock()
-+	return o.closed
++	if failedIdle && o.idleObserved {
++		o.idleFailed = true
++	}
++	return o.lastProgress, o.stalledLocked()
++}
++
++func (o *fallbackObservation) stalledLocked() bool {
++	if o.closed || len(o.writes) != 0 {
++		return false
++	}
++	for _, x := range o.pending {
++		if x.stalled {
++			return true
++		}
++	}
++	return o.idleFailed
++}
++
++func (o *fallbackObservation) claimStall(progress time.Time) bool {
++	o.mux.Lock()
++	defer o.mux.Unlock()
++	if o.lastProgress != progress || !o.stalledLocked() {
++		return false
++	}
++	o.closed = true
++	o.stopTimerLocked()
++	return true
 +}
 +
 +func (o *fallbackObservation) fallbackState() *fallbackObservation {
@@ -305,28 +400,23 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +}
 +
 +func (c *fallbackObserverConn) Write(b []byte) (int, error) {
-+	observed := len(b) > 0 || N.NeedHandshake(c.Conn)
-+	if observed {
-+		c.beginWrite("")
-+		defer c.endWrite()
++	if len(b) == 0 && !N.NeedHandshake(c.Conn) {
++		return c.Conn.Write(b)
 +	}
++	w := c.beginWrite("")
 +	n, err := c.Conn.Write(b)
-+	if err != nil {
-+		c.markError(err)
-+	}
++	c.endWrite(w, n > 0, err)
 +	return n, err
 +}
 +
 +func (c *fallbackObserverConn) WriteBuffer(buffer *buf.Buffer) error {
-+	observed := buffer.Len() > 0 || N.NeedHandshake(c.Conn)
-+	if observed {
-+		c.beginWrite("")
-+		defer c.endWrite()
++	size := buffer.Len()
++	if size == 0 && !N.NeedHandshake(c.Conn) {
++		return c.Conn.WriteBuffer(buffer)
 +	}
++	w := c.beginWrite("")
 +	err := c.Conn.WriteBuffer(buffer)
-+	if err != nil {
-+		c.markError(err)
-+	}
++	c.endWrite(w, err == nil && size > 0, err)
 +	return err
 +}
 +
@@ -355,7 +445,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +func (c *fallbackObserverPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 +	n, addr, err := c.PacketConn.ReadFrom(b)
 +	if n > 0 {
-+		c.markSuccess(fallbackPacketHost(addr))
++		c.markSuccess(fallbackPacketKey(addr))
 +	}
 +	if err != nil {
 +		c.markPacketReadError(err)
@@ -366,7 +456,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +func (c *fallbackObserverPacketConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
 +	data, put, addr, err := c.PacketConn.WaitReadFrom()
 +	if len(data) > 0 {
-+		c.markSuccess(fallbackPacketHost(addr))
++		c.markSuccess(fallbackPacketKey(addr))
 +	}
 +	if err != nil {
 +		c.markPacketReadError(err)
@@ -375,16 +465,22 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +}
 +
 +func (c *fallbackObserverPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
-+	host := fallbackPacketHost(addr)
-+	if len(b) > 0 {
-+		c.beginWrite(host)
-+		defer c.endWrite()
++	if len(b) == 0 {
++		return c.PacketConn.WriteTo(b, addr)
 +	}
++	w := c.beginWrite(fallbackPacketKey(addr))
 +	n, err := c.PacketConn.WriteTo(b, addr)
-+	if err != nil {
-+		c.markPacketWriteError(err, host)
-+	}
++	c.endWrite(w, n > 0, err)
 +	return n, err
++}
++
++func (c *fallbackObserverPacketConn) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
++	host := metadataHostKey(metadata)
++	err := c.PacketConn.ResolveUDP(ctx, metadata)
++	if err == nil {
++		c.rememberAddress(metadata, host)
++	}
++	return err
 +}
 +
 +func (c *fallbackObserverPacketConn) Close() error {
@@ -404,35 +500,57 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	return c.PacketConn
 +}
 +
-+func fallbackPacketHost(addr net.Addr) string {
++func fallbackPacketKey(addr net.Addr) string {
 +	if addr == nil {
 +		return "_unknown_"
 +	}
-+	host, _, err := net.SplitHostPort(addr.String())
-+	if err != nil {
-+		host = addr.String()
-+	}
-+	return strings.ToLower(host)
++	return strings.ToLower(addr.String())
 +}
 +
-+func fallbackStateFor(value any, group *Fallback, proxy C.Proxy) *fallbackObservation {
-+	for value != nil {
-+		if observed, ok := value.(interface{ fallbackState() *fallbackObservation }); ok {
-+			state := observed.fallbackState()
-+			if state.group == group && state.proxy == proxy {
-+				return state
-+			}
-+		}
-+		switch upstream := value.(type) {
-+		case N.WithUpstream:
-+			value = upstream.Upstream()
-+		case interface{ NetConn() net.Conn }:
-+			value = upstream.NetConn()
-+		default:
++func (o *fallbackObservation) rememberAddress(metadata *C.Metadata, host string) {
++	if metadata == nil || !metadata.DstIP.IsValid() || host == "" {
++		return
++	}
++	key := metadata.AddrPort().String()
++	o.mux.Lock()
++	if old, exists := o.addresses[key]; !exists || old == host {
++		o.addresses[key] = host
++	} else {
++		o.addresses[key] = ""
++	}
++	o.mux.Unlock()
++}
++
++func (o *fallbackObservation) packetHost(key string) string {
++	if alias := o.addresses[key]; alias != "" {
++		return alias
++	}
++	if host, _, err := net.SplitHostPort(key); err == nil {
++		return host
++	}
++	return key
++}
++
++func fallbackStateFor(tracker statistic.Tracker, group *Fallback, proxy C.Proxy) *fallbackObservation {
++	outer, ok := tracker.(N.WithUpstream)
++	if !ok {
++		return nil
++	}
++	value := outer.Upstream()
++	for {
++		wrapped, ok := value.(interface {
++			fallbackState() *fallbackObservation
++			Upstream() any
++		})
++		if !ok {
 +			return nil
 +		}
++		state := wrapped.fallbackState()
++		if state.group == group && state.proxy == proxy {
++			return state
++		}
++		value = wrapped.Upstream()
 +	}
-+	return nil
 +}
 +
 +var _ C.Conn = (*fallbackObserverConn)(nil)
@@ -475,7 +593,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  type FallbackOption struct{}
  
  type Fallback struct {
-@@ -21,6 +478,483 @@ type Fallback struct {
+@@ -21,6 +596,504 @@ type Fallback struct {
  	testUrl        string
  	selected       string
  	expectedStatus string
@@ -614,11 +732,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	return now.Before(st.cooldownUntil)
 +}
 +
-+func (f *Fallback) demoteProxy(proxy C.Proxy, reason string) {
-+	f.demoteProxyIfOwner(proxy, nil, reason)
-+}
-+
-+func (f *Fallback) demoteProxyIfOwner(proxy C.Proxy, owner *proxyFailState, reason string) {
++func (f *Fallback) demoteProxyIfOwner(proxy C.Proxy, owner *proxyFailState, reason string, failedIdle bool) {
 +	if proxy == nil || isSkippableAdapter(proxy.Type()) {
 +		return
 +	}
@@ -659,22 +773,25 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	f.stateMux.Unlock()
 +
 +	log.Warnln("Fallback[%s]: proxy %s demoted for %v (%s)", f.Name(), name, cooldown, reason)
-+	go f.closeStalledConnectionsForProxy(proxy, st)
++	go f.closeStalledConnectionsForProxy(proxy, st, failedIdle)
 +}
 +
-+func (f *Fallback) closeStalledConnectionsForProxy(proxy C.Proxy, owner *proxyFailState) {
++func (f *Fallback) closeStalledConnectionsForProxy(proxy C.Proxy, owner *proxyFailState, failedIdle bool) {
 +	type trafficSample struct {
 +		observer *fallbackObservation
++		progress time.Time
++		upload   int64
 +		download int64
 +	}
 +	samples := make(map[statistic.Tracker]trafficSample)
 +	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
 +		observer := fallbackStateFor(c, f, proxy)
-+		if observer == nil || observer.isClosed() {
++		if observer == nil {
 +			return true
 +		}
-+		if info := c.Info(); info != nil {
-+			samples[c] = trafficSample{observer: observer, download: info.DownloadTotal.Load()}
++		progress, stalled := observer.sampleStall(failedIdle)
++		if info := c.Info(); stalled && info != nil {
++			samples[c] = trafficSample{observer: observer, progress: progress, upload: info.UploadTotal.Load(), download: info.DownloadTotal.Load()}
 +		}
 +		return true
 +	})
@@ -685,13 +802,16 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	closedCount := 0
 +	for c, sample := range samples {
 +		info := c.Info()
-+		if info == nil || sample.observer.isClosed() {
++		if info == nil {
 +			continue
 +		}
 +		f.stateMux.Lock()
 +		current := f.proxyStates[proxy.Name()] == owner && f.proxyStateLocked(proxy) == owner
 +		f.stateMux.Unlock()
-+		if current && info.DownloadTotal.Load() == sample.download {
++		if current && info.UploadTotal.Load() == sample.upload && info.DownloadTotal.Load() == sample.download && sample.observer.claimStall(sample.progress) {
++			if conn, ok := c.(interface{ SetWriteDeadline(time.Time) error }); ok {
++				_ = conn.SetWriteDeadline(time.Now())
++			}
 +			_ = c.Close()
 +			closedCount++
 +		}
@@ -755,6 +875,10 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +}
 +
 +func (f *Fallback) reportSuspect(proxy C.Proxy, host string, strong bool) {
++	f.reportEvidence(proxy, host, strong, strong)
++}
++
++func (f *Fallback) reportEvidence(proxy C.Proxy, host string, strong, responsePending bool) {
 +	if proxy == nil || isSkippableAdapter(proxy.Type()) {
 +		return
 +	}
@@ -772,6 +896,12 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	if st == nil || now.Before(st.cooldownUntil) {
 +		f.stateMux.Unlock()
 +		return
++	}
++	if responsePending && host != "_unknown_" {
++		if st.affectedHosts == nil {
++			st.affectedHosts = make(map[string]time.Time)
++		}
++		st.affectedHosts[host] = now
 +	}
 +
 +	// Only strong signals (watchdog stall / reset / timeout) count toward multi-host demotion.
@@ -796,24 +926,22 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		minGap := f.effectiveProbeGap(strong)
 +		switch {
 +		case st.probing:
-+			if strong {
-+				st.pendingProbe = true
-+			}
++			st.pendingProbe = true
++			st.pendingStrong = st.pendingStrong || strong
 +		case st.lastProbe.IsZero() || now.Sub(st.lastProbe) >= minGap:
 +			st.probing = true
 +			st.lastProbe = now
 +			st.stopProbeTimerLocked()
 +			shouldProbe = true
-+		case strong && st.probeTimer == nil:
-+			wait := minGap - now.Sub(st.lastProbe)
-+			f.scheduleProbeLocked(st, proxy, wait)
++		default:
++			f.scheduleProbeLocked(st, proxy, st.lastProbe.Add(minGap), strong)
 +		}
 +	}
 +	owner := st
 +	f.stateMux.Unlock()
 +
 +	if shouldDemoteMultiHost {
-+		f.demoteProxyIfOwner(proxy, owner, "multiple distinct hosts stalled/failed")
++		f.demoteProxyIfOwner(proxy, owner, "multiple distinct hosts stalled/failed", false)
 +		return
 +	}
 +
@@ -822,12 +950,20 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +}
 +
-+func (f *Fallback) scheduleProbeLocked(st *proxyFailState, proxy C.Proxy, wait time.Duration) {
++func (f *Fallback) scheduleProbeLocked(st *proxyFailState, proxy C.Proxy, due time.Time, strong bool) {
++	st.pendingStrong = st.pendingStrong || strong
++	if st.probeTimer != nil {
++		if !due.Before(st.probeDue) {
++			return
++		}
++		st.probeTimer.Stop()
++	}
++	st.probeDue = due
 +	st.probeGen++
 +	gen := st.probeGen
 +	owner := st
 +	p := proxy
-+	st.probeTimer = time.AfterFunc(wait, func() {
++	st.probeTimer = time.AfterFunc(time.Until(due), func() {
 +		f.runDeferredProbe(p, owner, gen)
 +	})
 +}
@@ -858,6 +994,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +	st.probing = true
 +	st.pendingProbe = false
++	st.pendingStrong = false
 +	st.lastProbe = now
 +	f.stateMux.Unlock()
 +
@@ -874,7 +1011,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +				st.probing = false
 +				if st.pendingProbe && st.probeTimer == nil && !time.Now().Before(st.cooldownUntil) && f.proxyStateLocked(proxy) == owner {
 +					st.pendingProbe = false
-+					f.scheduleProbeLocked(st, proxy, f.effectiveProbeGap(true))
++					f.scheduleProbeLocked(st, proxy, st.lastProbe.Add(f.effectiveProbeGap(st.pendingStrong)), st.pendingStrong)
 +				}
 +			}
 +			f.stateMux.Unlock()
@@ -893,9 +1030,9 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		errSelf, errPeer := f.probePair(ctx, proxy, peer)
 +		// Comparative health results apply to the current proxy instance and state owner.
 +		if errSelf != nil && errPeer == nil {
-+			f.demoteProxyIfOwner(proxy, owner, "comparative URLTest failed while peer ok: "+errSelf.Error())
++			f.demoteProxyIfOwner(proxy, owner, "comparative URLTest failed while peer ok: "+errSelf.Error(), true)
 +		} else if errSelf != nil && f.findAliveProxy(false) != proxy {
-+			go f.closeStalledConnectionsForProxy(proxy, owner)
++			go f.closeStalledConnectionsForProxy(proxy, owner, true)
 +		}
 +	}()
 +}
@@ -908,26 +1045,19 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		return
 +	}
 +
-+	for _, current := range f.GetProxies(false) {
-+		if current != proxy {
-+			continue
++	now := time.Now()
++	f.stateMux.Lock()
++	defer f.stateMux.Unlock()
++	if st := f.proxyStates[proxy.Name()]; st != nil && st.proxy == proxy {
++		delete(st.affectedHosts, host)
++		if now.Before(st.cooldownUntil) {
++			return
 +		}
-+		now := time.Now()
-+		f.stateMux.Lock()
-+		if st := f.proxyStates[proxy.Name()]; st != nil && st.proxy == proxy {
-+			if now.Before(st.cooldownUntil) {
-+				f.stateMux.Unlock()
-+				return
-+			}
-+			delete(st.suspectHosts, host)
-+			if st.backoffLevel > 0 && !st.cooldownUntil.IsZero() && now.Sub(st.cooldownUntil) >= f.effectiveRecoveryWindow() {
-+				st.backoffLevel--
-+				st.cooldownUntil = now
-+			}
++		delete(st.suspectHosts, host)
++		if st.backoffLevel > 0 && !st.cooldownUntil.IsZero() && now.Sub(st.cooldownUntil) >= f.effectiveRecoveryWindow() {
++			st.backoffLevel--
++			st.cooldownUntil = now
 +		}
-+		f.stateMux.Unlock()
-+		f.onDialSuccess()
-+		return
 +	}
 +}
 +
@@ -939,6 +1069,8 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		stallTimeout:   f.stallTimeoutForProxy(proxy),
 +		strongTimeout:  strong,
 +		closeTransport: closeTransport,
++		pending:        make(map[string]*fallbackExchange),
++		writes:         make(map[*fallbackWrite]struct{}),
 +	}
 +}
 +
@@ -947,27 +1079,35 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	if isSkippableAdapter(proxy.Type()) {
 +		return c
 +	}
-+	return &fallbackObserverConn{Conn: c, fallbackObservation: f.observe(proxy, host, true, c.Close)}
++	return &fallbackObserverConn{Conn: c, fallbackObservation: f.observe(proxy, host, true, func() error {
++		_ = c.SetWriteDeadline(time.Now())
++		return c.Close()
++	})}
 +}
 +
-+func (f *Fallback) wrapObservedPacketConn(c C.PacketConn, proxy C.Proxy, host string) C.PacketConn {
++func (f *Fallback) wrapObservedPacketConn(c C.PacketConn, proxy C.Proxy, metadata *C.Metadata) C.PacketConn {
 +	c.AppendToChains(f)
 +	if isSkippableAdapter(proxy.Type()) {
 +		return c
 +	}
-+	return &fallbackObserverPacketConn{PacketConn: c, fallbackObservation: f.observe(proxy, host, false, c.Close)}
++	host := metadataHostKey(metadata)
++	o := f.observe(proxy, host, false, func() error { _ = c.SetWriteDeadline(time.Now()); return c.Close() })
++	o.addresses = make(map[string]string)
++	o.rememberAddress(metadata, host)
++	return &fallbackObserverPacketConn{PacketConn: c, fallbackObservation: o}
  }
  
  func (f *Fallback) Now() string {
-@@ -28,38 +962,183 @@ func (f *Fallback) Now() string {
+@@ -28,38 +1101,203 @@ func (f *Fallback) Now() string {
  	return proxy.Name()
  }
  
 +type fallbackDialResult struct {
-+	idx   int
-+	proxy C.Proxy
-+	conn  C.Conn
-+	err   error
++	idx      int
++	proxy    C.Proxy
++	conn     C.Conn
++	err      error
++	metadata *C.Metadata
 +}
 +
  // DialContext implements C.ProxyAdapter
@@ -978,7 +1118,8 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 -		c.AppendToChains(f)
 -	} else {
 -		f.onDialFailed(proxy.Type(), err, f.healthCheck)
-+	candidates := f.getCandidates(true)
++	host := metadataHostKey(metadata)
++	candidates, ordinary := f.rankCandidates(true, host)
 +	maxAttempts := len(candidates)
 +	if maxAttempts > fallbackMaxDialAttempts {
 +		maxAttempts = fallbackMaxDialAttempts
@@ -990,8 +1131,6 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 -				f.onDialSuccess()
 -			} else {
 -				f.onDialFailed(proxy.Type(), err, f.healthCheck)
-+	host := metadataHostKey(metadata)
-+
 +	if maxAttempts == 1 {
 +		proxy := candidates[0]
 +		c, err := proxy.DialContext(ctx, metadata)
@@ -1016,16 +1155,17 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		idx := launched
 +		proxy := candidates[idx]
 +		launched++
++		dialMetadata := metadata.Clone()
 +		go func() {
-+			c, err := proxy.DialContext(dialCtx, metadata)
-+			resCh <- fallbackDialResult{idx: idx, proxy: proxy, conn: c, err: err}
++			c, err := proxy.DialContext(dialCtx, dialMetadata)
++			resCh <- fallbackDialResult{idx: idx, proxy: proxy, conn: c, err: err, metadata: dialMetadata}
 +		}()
 +	}
 +
 +	launchNext()
 +
 +	stagger := time.NewTimer(f.staggerDelayForProxy(candidates[0]))
-+	defer stagger.Stop()
++	defer func() { stagger.Stop() }()
 +
 +	finished := make([]bool, maxAttempts)
 +	var failedResults []fallbackDialResult
@@ -1033,7 +1173,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +
 +	for completed < maxAttempts {
 +		var timerCh <-chan time.Time
-+		if launched < maxAttempts {
++		if launched < maxAttempts && (launched < ordinary || completed == launched) {
 +			timerCh = stagger.C
 +		}
 +
@@ -1043,6 +1183,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +			finished[res.idx] = true
 +			if res.err == nil && res.conn != nil {
 +				cancelAll()
++				*metadata = *res.metadata
 +				remaining := launched - completed
 +				if remaining > 0 {
 +					go func(n int) {
@@ -1064,23 +1205,19 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +					f.reportSuspect(failed.proxy, host, isStrongFallbackError(failed.err))
 +				}
 +				return f.wrapObservedConn(res.conn, res.proxy, host), nil
-+			}
+ 			}
+-		})
 +
 +			lastErr = res.err
 +			if ctx.Err() == nil && !isIgnoredFallbackError(res.err) {
 +				failedResults = append(failedResults, res)
 +			}
-+			if launched < maxAttempts {
++			if launched < maxAttempts && (launched < ordinary || completed == launched) {
 +				nextProxy := candidates[launched]
 +				launchNext()
 +				if launched < maxAttempts {
-+					if !stagger.Stop() {
-+						select {
-+						case <-stagger.C:
-+						default:
-+						}
-+					}
-+					stagger.Reset(f.staggerDelayForProxy(nextProxy))
++					stagger.Stop()
++					stagger = time.NewTimer(f.staggerDelayForProxy(nextProxy))
 +				}
 +			}
 +
@@ -1103,8 +1240,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +						}
 +					}
 +				}(remaining)
- 			}
--		})
++			}
 +			if lastErr != nil {
 +				return nil, lastErr
 +			}
@@ -1127,25 +1263,50 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 -	pc, err := proxy.ListenPacketContext(ctx, metadata)
 -	if err == nil {
 -		pc.AppendToChains(f)
-+	candidates := f.getCandidates(true)
 +	host := metadataHostKey(metadata)
++	candidates := f.getCandidates(true, host)
++	eligible := candidates[:0]
++	for _, proxy := range candidates {
++		if proxy.SupportUDP() {
++			eligible = append(eligible, proxy)
++		}
+ 	}
+-
+-	return pc, err
 +	var failures []fallbackDialResult
 +	lastErr := C.ErrNotSupport
 +	attempts := 0
-+	for _, proxy := range candidates {
-+		if !proxy.SupportUDP() {
-+			continue
-+		}
++	for i, proxy := range eligible {
 +		if attempts >= fallbackMaxDialAttempts {
 +			break
 +		}
++		remaining := len(eligible) - i
++		if limit := fallbackMaxDialAttempts - attempts; remaining > limit {
++			remaining = limit
++		}
 +		attempts++
-+		pc, err := proxy.ListenPacketContext(ctx, metadata)
++		attemptCtx := ctx
++		var cancel context.CancelFunc
++		if remaining > 1 {
++			budget := f.stallTimeoutForProxy(proxy)
++			if deadline, ok := ctx.Deadline(); ok {
++				if share := time.Until(deadline) / time.Duration(remaining); share < budget {
++					budget = share
++				}
++			}
++			attemptCtx, cancel = context.WithTimeout(ctx, budget)
++		}
++		attemptMetadata := metadata.Clone()
++		pc, err := proxy.ListenPacketContext(attemptCtx, attemptMetadata)
++		if cancel != nil {
++			cancel()
++		}
 +		if err == nil {
++			*metadata = *attemptMetadata
 +			for _, failed := range failures {
 +				f.reportSuspect(failed.proxy, host, isStrongFallbackError(failed.err))
 +			}
-+			return f.wrapObservedPacketConn(pc, proxy, host), nil
++			return f.wrapObservedPacketConn(pc, proxy, metadata), nil
 +		}
 +		lastErr = err
 +		if ctx.Err() != nil {
@@ -1156,21 +1317,19 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +			continue
 +		}
 +		failures = append(failures, fallbackDialResult{proxy: proxy, err: err})
- 	}
--
--	return pc, err
++	}
 +	return nil, lastErr
  }
  
  // SupportUDP implements C.ProxyAdapter
-@@ -67,9 +1146,12 @@ func (f *Fallback) SupportUDP() bool {
+@@ -67,14 +1305,17 @@ func (f *Fallback) SupportUDP() bool {
  	if f.disableUDP {
  		return false
  	}
 -
 -	proxy := f.findAliveProxy(false)
 -	return proxy.SupportUDP()
-+	for _, proxy := range f.getCandidates(false) {
++	for _, proxy := range f.getCandidates(false, "") {
 +		if proxy.SupportUDP() {
 +			return true
 +		}
@@ -1179,7 +1338,13 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  // IsL3Protocol implements C.ProxyAdapter
-@@ -83,13 +1165,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+ func (f *Fallback) IsL3Protocol(metadata *C.Metadata) bool {
+-	return f.findAliveProxy(false).IsL3Protocol(metadata)
++	return f.getCandidates(false, metadataHostKey(metadata))[0].IsL3Protocol(metadata)
+ }
+ 
+ // MarshalJSON implements C.ProxyAdapter
+@@ -83,13 +1324,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
  	for _, proxy := range f.GetProxies(false) {
  		all = append(all, proxy.Name())
  	}
@@ -1197,12 +1362,22 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  		"hidden":         f.Hidden(),
  		"icon":           f.Icon(),
  		"emptyFallback":  f.EmptyFallback().Name(),
-@@ -102,25 +1187,82 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
- 	return proxy
+@@ -98,29 +1342,151 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+ 
+ // Unwrap implements C.ProxyAdapter
+ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+-	proxy := f.findAliveProxy(touch)
+-	return proxy
++	return f.getCandidates(touch, metadataHostKey(metadata))[0]
  }
  
 -func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
-+func (f *Fallback) getCandidates(touch bool) []C.Proxy {
++func (f *Fallback) getCandidates(touch bool, host string) []C.Proxy {
++	candidates, _ := f.rankCandidates(touch, host)
++	return candidates
++}
++
++func (f *Fallback) rankCandidates(touch bool, host string) ([]C.Proxy, int) {
  	proxies := f.GetProxies(touch)
 -	for _, proxy := range proxies {
 -		if len(f.selected) == 0 {
@@ -1222,6 +1397,12 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +			if active[name] != st.proxy {
 +				st.stopProbeTimerLocked()
 +				delete(f.proxyStates, name)
++			} else {
++				for h, ts := range st.affectedHosts {
++					if now.Sub(ts) >= fallbackHostWindow {
++						delete(st.affectedHosts, h)
++					}
++				}
  			}
 -		} else {
 -			if proxy.Name() == f.selected {
@@ -1241,10 +1422,11 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  					f.selected = ""
  				}
 +				break
-+			}
-+		}
-+	}
-+
+ 			}
+ 		}
+ 	}
+ 
+-	return proxies[0]
 +	aliveHealthy := make([]C.Proxy, 0, len(proxies))
 +	aliveDemoted := make([]C.Proxy, 0)
 +	otherHealthy := make([]C.Proxy, 0)
@@ -1270,27 +1452,81 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +				otherHealthy = append(otherHealthy, proxy)
 +			} else {
 +				otherDemoted = append(otherDemoted, proxy)
- 			}
- 		}
- 	}
-+	f.stateMux.Unlock()
- 
--	return proxies[0]
++			}
++		}
++	}
 +	candidates := make([]C.Proxy, 0, len(proxies))
 +	candidates = append(candidates, aliveHealthy...)
 +	candidates = append(candidates, aliveDemoted...)
 +	candidates = append(candidates, otherHealthy...)
 +	candidates = append(candidates, otherDemoted...)
-+	return candidates
++	ordinary := len(candidates)
++	if host != "" {
++		hasFailure := false
++		for _, proxy := range candidates {
++			if f.affectedLocked(proxy, host, now) {
++				hasFailure = true
++				break
++			}
++		}
++		if hasFailure {
++			rank := func(p C.Proxy) int {
++				if f.affectedLocked(p, host, now) {
++					return 2
++				}
++				if isSkippableAdapter(p.Type()) || f.isDemotedLocked(p, now) || !p.AliveForTestUrl(f.testUrl) {
++					return 1
++				}
++				return 0
++			}
++			sort.SliceStable(candidates, func(i, j int) bool { return rank(candidates[i]) < rank(candidates[j]) })
++			for i, p := range candidates {
++				if rank(p) == 2 {
++					if i > 0 {
++						ordinary = i
++					}
++					break
++				}
++			}
++		}
++	}
++	f.stateMux.Unlock()
++	return candidates, ordinary
++}
++
++func (f *Fallback) affectedLocked(proxy C.Proxy, host string, now time.Time) bool {
++	st := f.proxyStates[proxy.Name()]
++	if st == nil || st.proxy != proxy {
++		return false
++	}
++	at, found := st.affectedHosts[host]
++	return found && now.Sub(at) < fallbackHostWindow
++}
++
++func (f *Fallback) alternateFor(proxy C.Proxy, host string, udp bool) bool {
++	proxies := f.GetProxies(false)
++	now := time.Now()
++	for _, p := range proxies {
++		if p == proxy || isSkippableAdapter(p.Type()) || (udp && !p.SupportUDP()) || !p.AliveForTestUrl(f.testUrl) {
++			continue
++		}
++		f.stateMux.Lock()
++		ok := f.affectedLocked(proxy, host, now) && !f.isDemotedLocked(p, now) && !f.affectedLocked(p, host, now)
++		f.stateMux.Unlock()
++		if ok {
++			return true
++		}
++	}
++	return false
 +}
 +
 +func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
-+	candidates := f.getCandidates(touch)
++	candidates := f.getCandidates(touch, "")
 +	return candidates[0]
  }
  
  func (f *Fallback) Set(name string) error {
-@@ -136,7 +1278,14 @@ func (f *Fallback) Set(name string) error {
+@@ -136,7 +1502,14 @@ func (f *Fallback) Set(name string) error {
  		return errors.New("proxy not exist")
  	}
  
@@ -1305,7 +1541,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  	if !p.AliveForTestUrl(f.testUrl) {
  		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
  		defer cancel()
-@@ -148,7 +1297,13 @@ func (f *Fallback) Set(name string) error {
+@@ -148,7 +1521,13 @@ func (f *Fallback) Set(name string) error {
  }
  
  func (f *Fallback) ForceSet(name string) {
@@ -1319,7 +1555,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  func (f *Fallback) Providers() []P.ProxyProvider {
-@@ -178,5 +1333,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+@@ -178,5 +1557,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
  		expectedStatus: option.ExpectedStatus,

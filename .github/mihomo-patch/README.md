@@ -15,34 +15,24 @@ compiles the package remotely with `go build ./adapter/outboundgroup/...`.
 
 ## Shared contract
 
-- Arm response observation before payload writes and keep it active throughout
-  the connection. Each outstanding response interval has a fixed RTT-based
-  4–10 second deadline; further writes retain that deadline. A response ends the
-  interval, and the next payload write arms another. A write still in progress
-  retains deadline protection until its completion.
-- Downstream progress also starts one weak idle observation. Further received
-  bytes refresh it; the next write replaces it with the fixed response interval.
-  This covers stalled downloads while healthy idle sessions remain open after
-  successful comparative checks.
-- TCP response expiry and strong I/O failures supply strong evidence, including
-  failures after the first response. Orderly EOF after establishment is normal;
-  pre-response EOF and UDP silence supply weak evidence for comparative checks.
-  Local SOCKS failures remain local.
-- Earlier dial candidates canceled after a later candidate succeeds trigger a
-  weak comparative check. UDP idle read expiry is normal; an outstanding UDP
-  response timeout remains weak evidence, attributed to its destination address.
-- Three distinct destination hosts with strong failures within 60 seconds can
-  demote a node even while its health URL responds. Selective failures affecting
-  one or two hosts still require comparative evidence: the current node fails
-  while a peer succeeds. Strong and weak checks use minimum gaps of 3 and
-  15 seconds. Successful traffic clears only that destination's failure evidence.
-- Failure state belongs to each proxy instance. Cooldown grows through 30, 60,
-  120, 240, and 300 seconds; late replies preserve an active cooldown.
-- Close blocked writes at the response deadline. Original stalled flows
-  reevaluate selection after asynchronous health checks. SimpleXray permits
-  bounded replay before the first response; established sessions reconnect
-  through the application.
-- Demotion samples received bytes over 2 seconds and closes stalled connections;
-  downloads making byte progress keep their connections. Observed failover time
-  includes applicable check gaps, health checks, and cleanup as well as the
-  response window.
+- Each payload write has its own RTT-based 4–10 second deadline. Completed TCP
+  writes advance the response deadline. Incoming bytes complete the matching
+  exchange and refresh idle observation. Outstanding responses and idle flows
+  remain observable after expiry; the next write starts a fresh response window.
+- A real TCP response stall, early EOF with a pending request, strong I/O error, or UDP exchange that
+  goes silent moves that member behind alternatives **for the affected host** for
+  60 seconds. Other hosts keep their normal order. A matching reply clears the
+  host's evidence. A group with every member affected retains its normal order.
+- Group-wide demotion requires three distinct strong-failure hosts in 60 seconds,
+  or failure of the configured health URL while a peer succeeds. UDP silence,
+  pre-response EOF, canceled earlier dials and downstream idle periods are weak
+  signals. Strong and weak checks coalesce with minimum gaps of 3 and 15 seconds.
+  Instance-owned cooldowns grow through 30, 60, 120, 240 and 300 seconds.
+- Shared UDP transports observe pending destinations separately. Replies from an
+  active destination keep its association useful while another exchange is silent.
+- Cleanup samples a stalled transport over two seconds. Active transfers and
+  healthy idle sessions keep their connections. Confirmed health failure can
+  retire a silent download. An established TCP stream reconnects through its
+  application; SimpleXray can replay up to 256 KiB before its first response.
+- The group-wide indicator describes the default candidate. A destination-specific
+  route can already be using a backup while the indicator shows the primary.
