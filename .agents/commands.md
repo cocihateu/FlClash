@@ -18,9 +18,12 @@ git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$PWD/.
 Apply the fallback patch once after initializing the pinned Core submodule. This fork's fallback uses
 comparative health checks, instance-scoped cooldowns, staggered TCP attempts and sequential UDP fallback.
 Local builds, Build Fork and the manual `build` workflow apply the production fallback patch with
-`--include=adapter/outboundgroup/fallback.go`. The patch's original `fallback_test.go` regression-test section
-remains historical and is excluded by this filter. The manual workflow compiles the production package with
-`go build ./adapter/outboundgroup/...`.
+`--include=adapter/outboundgroup/fallback.go`. The patch contains production changes to that file, matching
+CMA's canonical observation and failure policy while retaining FlClash's upstream `UsePosition` constructor
+argument and adapting hunk offsets to the pinned source. The manual
+workflow compiles the production package remotely with `go build ./adapter/outboundgroup/...`.
+Keep the response-window, failure-evidence, and cleanup contract in
+[the fallback policy](../.github/mihomo-patch/README.md) aligned with CMA and SimpleXray's Kotlin port.
 
 Full package build, including Go core, Flutter, and packaging, runs through `tool/package.dart` (`make package`,
 `make package-android`, with `ARCH=`, `FORM=` and `DRY=1`). Run it with `dart`, not `dart run`, which first runs
