@@ -8,12 +8,12 @@ A multi-platform proxy client based on ClashMeta. Simple to use, open source and
 
 **English** · [简体中文](README_zh_CN.md)
 
-[![Release](https://img.shields.io/github/v/release/chen08209/FlClash?style=flat-square&label=release)](https://github.com/chen08209/FlClash/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/chen08209/FlClash/total?style=flat-square&logo=github)](https://github.com/chen08209/FlClash/releases)
+[![Build Fork](https://github.com/cocihateu/FlClash/actions/workflows/build-fork.yaml/badge.svg)](https://github.com/cocihateu/FlClash/actions/workflows/build-fork.yaml)
+[![Downloads](https://img.shields.io/github/downloads/cocihateu/FlClash/total?style=flat-square&logo=github)](https://github.com/cocihateu/FlClash/releases)
 [![License](https://img.shields.io/github/license/chen08209/FlClash?style=flat-square)](LICENSE)
 [![Telegram](https://img.shields.io/badge/Telegram-channel-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/FlClash)
 
-[Website](https://chen08209.github.io/FlClash) · [Download](#download) · [Changelog](CHANGELOG.md) · [Build from source](#build-from-source)
+[Upstream website](https://chen08209.github.io/FlClash) · [Download](#download) · [Changelog](CHANGELOG.md) · [Build from source](#build-from-source)
 
 </div>
 
@@ -40,8 +40,9 @@ A multi-platform proxy client based on ClashMeta. Simple to use, open source and
 
 ## Download
 
-Get the latest build from [GitHub Releases](https://github.com/chen08209/FlClash/releases/latest), or open the
-[website](https://chen08209.github.io/FlClash#download), which picks the right file for your device.
+For this fork, open a successful [Build Fork run](https://github.com/cocihateu/FlClash/actions/workflows/build-fork.yaml) and download `FlClash-<platform>-fallback` under **Artifacts**. Pushes to `main` build Android and Windows; manual runs build the selected platform. Separately published packages appear on the [fork's Releases page](https://github.com/cocihateu/FlClash/releases).
+
+The upstream website, F-Droid repository and Homebrew tap distribute upstream packages.
 
 | Platform | Packages | Notes |
 | --- | --- | --- |
@@ -52,7 +53,7 @@ Get the latest build from [GitHub Releases](https://github.com/chen08209/FlClash
 
 <p>
   <a href="https://chen08209.github.io/FlClash-fdroid-repo/repo?fingerprint=789D6D32668712EF7672F9E58DEEB15FBD6DCEEC5AE7A4371EA72F2AAE8A12FD"><img alt="Get it on F-Droid" src="snapshots/get-it-on-fdroid.svg" height="56"></a>
-  <a href="https://github.com/chen08209/FlClash/releases/latest"><img alt="Get it on GitHub" src="snapshots/get-it-on-github.svg" height="56"></a>
+  <a href="https://github.com/cocihateu/FlClash/actions/workflows/build-fork.yaml"><img alt="Get fork artifacts on GitHub" src="snapshots/get-it-on-github.svg" height="56"></a>
 </p>
 
 **Homebrew**
@@ -103,10 +104,12 @@ You need [Flutter](https://docs.flutter.dev/get-started/install) 3.50 (release b
 host, except Android, which builds anywhere.
 
 ```bash
-git clone --recursive https://github.com/chen08209/FlClash.git
+git clone --recursive https://github.com/cocihateu/FlClash.git
 cd FlClash
+git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
+git -C core/Clash.Meta apply "$PWD/.github/mihomo-patch/fallback-udp.patch"
 flutter pub get
-dart run tool/package.dart android   # or windows, macos, linux
+dart tool/package.dart android   # or windows, macos, linux
 ```
 
 Packages land in `dist/`. The Go core and the Rust libraries are compiled as part of the Flutter build.
@@ -114,11 +117,11 @@ Packages land in `dist/`. The Go core and the Rust libraries are compiled as par
 | Platform | Also needed |
 | --- | --- |
 | Android | Android SDK with the NDK. Add `--arch arm64` to build a single ABI. |
-| Windows | GCC (MinGW-w64) for the core and [Inno Setup](https://jrsoftware.org/isinfo.php) 6 for the installer. |
+| Windows | The desktop Go core builds with `CGO_ENABLED=0`. Use the Flutter Windows toolchain for the app and [Inno Setup](https://jrsoftware.org/isinfo.php) 6 for the installer. |
 | macOS | Xcode and Node.js. The script installs `appdmg` through npm. |
 | Linux | Debian or Ubuntu. The script installs the build packages with apt and downloads `appimagetool`. |
 
-Run `dart run tool/package.dart --help` for the remaining options, such as `--targets` to build only some package formats or `--dry-run` to list the files a run would write.
+Run `dart tool/package.dart --help` for the remaining options, such as `--targets` to build only some package formats or `--dry-run` to list the files a run would write.
 
 ## Support
 

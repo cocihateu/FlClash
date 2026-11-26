@@ -8,12 +8,12 @@
 
 [English](README.md) · **简体中文**
 
-[![Release](https://img.shields.io/github/v/release/chen08209/FlClash?style=flat-square&label=release)](https://github.com/chen08209/FlClash/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/chen08209/FlClash/total?style=flat-square&logo=github)](https://github.com/chen08209/FlClash/releases)
+[![Build Fork](https://github.com/cocihateu/FlClash/actions/workflows/build-fork.yaml/badge.svg)](https://github.com/cocihateu/FlClash/actions/workflows/build-fork.yaml)
+[![Downloads](https://img.shields.io/github/downloads/cocihateu/FlClash/total?style=flat-square&logo=github)](https://github.com/cocihateu/FlClash/releases)
 [![License](https://img.shields.io/github/license/chen08209/FlClash?style=flat-square)](LICENSE)
 [![Telegram](https://img.shields.io/badge/Telegram-channel-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://t.me/FlClash)
 
-[官网](https://chen08209.github.io/FlClash/zh) · [下载](#下载) · [更新日志](CHANGELOG.md) · [从源码构建](#从源码构建)
+[上游官网](https://chen08209.github.io/FlClash/zh) · [下载](#下载) · [更新日志](CHANGELOG.md) · [从源码构建](#从源码构建)
 
 </div>
 
@@ -37,8 +37,9 @@
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/chen08209/FlClash/releases/latest) 获取最新版本，或打开
-[官网](https://chen08209.github.io/FlClash/zh#download)，它会自动为你的设备选好安装包。
+打开本仓库一次成功的 [Build Fork 构建](https://github.com/cocihateu/FlClash/actions/workflows/build-fork.yaml)，在 **Artifacts** 中下载 `FlClash-<platform>-fallback`。每次推送到 `main` 会构建 Android 和 Windows，手动运行时可选择目标平台。单独发布的版本可在[本仓库的 Releases 页面](https://github.com/cocihateu/FlClash/releases)查看。
+
+上游官网、F-Droid 仓库和 Homebrew 提供上游版本。
 
 | 平台 | 安装包 | 说明 |
 | --- | --- | --- |
@@ -49,7 +50,7 @@
 
 <p>
   <a href="https://chen08209.github.io/FlClash-fdroid-repo/repo?fingerprint=789D6D32668712EF7672F9E58DEEB15FBD6DCEEC5AE7A4371EA72F2AAE8A12FD"><img alt="Get it on F-Droid" src="snapshots/get-it-on-fdroid.svg" height="56"></a>
-  <a href="https://github.com/chen08209/FlClash/releases/latest"><img alt="Get it on GitHub" src="snapshots/get-it-on-github.svg" height="56"></a>
+  <a href="https://github.com/cocihateu/FlClash/actions/workflows/build-fork.yaml"><img alt="在 GitHub 下载本仓库构建产物" src="snapshots/get-it-on-github.svg" height="56"></a>
 </p>
 
 **Homebrew**
@@ -96,10 +97,12 @@ adb shell am start -a com.follow.clash.action.TOGGLE
 以及通过 rustup 安装的 [Rust](https://rustup.rs/)。桌面端需要在对应系统上构建，Android 在任意系统上都能构建。
 
 ```bash
-git clone --recursive https://github.com/chen08209/FlClash.git
+git clone --recursive https://github.com/cocihateu/FlClash.git
 cd FlClash
+git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
+git -C core/Clash.Meta apply "$PWD/.github/mihomo-patch/fallback-udp.patch"
 flutter pub get
-dart run tool/package.dart android   # 或 windows、macos、linux
+dart tool/package.dart android   # 或 windows、macos、linux
 ```
 
 安装包输出到 `dist/`。Go 内核和 Rust 库会在 Flutter 构建过程中一并编译。
@@ -107,11 +110,11 @@ dart run tool/package.dart android   # 或 windows、macos、linux
 | 平台 | 额外依赖 |
 | --- | --- |
 | Android | 带 NDK 的 Android SDK。加上 `--arch arm64` 可以只构建单个 ABI。 |
-| Windows | 编译内核用的 GCC（MinGW-w64），以及打包安装程序用的 [Inno Setup](https://jrsoftware.org/isinfo.php) 6。 |
+| Windows | 桌面 Go 内核使用 `CGO_ENABLED=0` 编译。应用使用 Flutter 的 Windows 工具链，安装程序使用 [Inno Setup](https://jrsoftware.org/isinfo.php) 6 打包。 |
 | macOS | Xcode 与 Node.js。脚本会通过 npm 安装 `appdmg`。 |
 | Linux | Debian 或 Ubuntu。脚本会用 apt 安装构建所需的软件包，并下载 `appimagetool`。 |
 
-其余选项可以运行 `dart run tool/package.dart --help` 查看，例如用 `--targets` 只构建部分安装包格式，用 `--dry-run` 列出这次会生成的文件。
+其余选项可以运行 `dart tool/package.dart --help` 查看，例如用 `--targets` 只构建部分安装包格式，用 `--dry-run` 列出这次会生成的文件。
 
 ## 支持
 

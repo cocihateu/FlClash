@@ -13,14 +13,14 @@ Update submodules first. The ClashMeta Go core lives in `core/Clash.Meta/`, the 
 ```bash
 git submodule update --init --recursive
 git -C core/Clash.Meta apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
+git -C core/Clash.Meta apply "$PWD/.github/mihomo-patch/fallback-udp.patch"
 ```
 
-Apply the fallback patch once after initializing the pinned Core submodule. This fork's fallback uses
-comparative health checks, instance-scoped cooldowns, staggered TCP attempts and sequential UDP fallback.
-Local builds, Build Fork and the manual `build` workflow apply the production fallback patch with
-`--include=adapter/outboundgroup/fallback.go`. The patch contains production changes to that file, matching
-CMA's canonical observation and failure policy while retaining FlClash's upstream `UsePosition` constructor
-argument and adapting hunk offsets to the pinned source. The manual
+Apply both patches once after initializing the pinned Core submodule. First apply `enhance-fallback.patch` with
+the file filter shown above for comparative health checks, instance-scoped cooldowns and staggered TCP attempts.
+Then apply `fallback-udp.patch` in full so destinations sharing a local UDP endpoint can fail over independently.
+FlClash follows CMA's observation and failure policy while retaining its upstream `UsePosition` constructor
+argument and adapting hunk offsets to the pinned source. The manual `build`
 workflow compiles the production package remotely with `go build ./adapter/outboundgroup/...`.
 Keep the response-window, failure-evidence, and cleanup contract in
 [the fallback policy](../.github/mihomo-patch/README.md) aligned with CMA and SimpleXray's Kotlin port.
@@ -311,8 +311,10 @@ dart run tool/changelog.dart render release --out release.md
 dart run tool/changelog.dart render telegram --out telegram.md
 ```
 
-The retained release tooling below describes the upstream tag-release path. This fork distributes the fixed-version
-Build Fork artifacts described in Building; its general `build` workflow starts through `workflow_dispatch`.
+This fork distributes [Build Fork artifacts](https://github.com/cocihateu/FlClash/actions/workflows/build-fork.yaml):
+pushes to `main` build Android and Windows, and a manual run builds the selected platform. The legacy `build`
+workflow runs only on `workflow_dispatch`; its tag-publishing jobs require an upstream tag push. The commands
+below describe that upstream release process, separate from this fork's artifact builds.
 
 Preparing an upstream stable release, in order:
 
@@ -456,7 +458,7 @@ proportions, and the slanted wipes, the dot-to-bar marks and the theme transitio
 inside the hero has to be listed in `wireField` in `app.js`, or the capsules run behind it.
 
 `.github/workflows/pages.yaml` deploys it after every successful stable tag build and on pushes to `main` that touch the
-site, in the public repository only; its Pages source has to be set to GitHub Actions once. The file names come from the
+site, in the upstream repository only; its Pages source has to be set to GitHub Actions once. The file names come from the
 release matrix in `build.yaml`, so a renamed artifact needs the same change in `buildsFor` in `site/assets/app.js`.
 
 ## Verify
@@ -479,18 +481,15 @@ new hook script needs only its test file next to it, not a workflow step.
 
 Run `flutter analyze --no-fatal-infos` before committing; CI runs the same command and fails on a warning or error.
 
-Release builds run only for `v*` tag pushes; pull requests trigger nothing.
 Root analysis excludes `plugins/**`, and root tests do not discover nested
 plugin packages, so parallel jobs validate the rest from their own package
 directories: `plugins` (local Flutter packages and the setup build tool), `go`
 (the Core wrapper, plus a vet of the Android files), `android` (JVM unit tests
 for `:common`, `:service` and `:app`, with the Flutter compile tasks excluded
 and the gomobile AAR built for one ABI), `rust` (both crates), and a
-Windows runner for the helper's `windows-service` feature. On branch pushes a
-`desktop` job also compiles a debug build per desktop platform; a tag skips it,
-since its release matrix compiles the same native code. Release builds run only
-in the public repository and start alongside the checks; `upload` publishes
-only once every build and every check job passes.
+Windows runner for the helper's `windows-service` feature. On manual dispatch the
+`desktop` job also compiles a debug build per desktop platform. The separate Build
+Fork workflow supplies this fork's downloadable artifacts as described in [Building](#building).
 
 `bash tool/check_plugins.sh` is that plugin gate, and CI runs the same script.
 It discovers every `plugins/*/pubspec.yaml`, analyzes each package, and runs

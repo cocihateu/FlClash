@@ -8,31 +8,45 @@ constructor argument and adapt each patch's hunk offsets to its pinned source.
 SimpleXray implements the equivalent policy through its existing
 Kotlin `FallbackRelayServer`, `GroupRuntimeController`, and `FallbackPolicy`.
 
-`enhance-fallback.patch` contains production changes to
-`adapter/outboundgroup/fallback.go`. Build Fork and the manual `build` workflow
-apply it with `--include=adapter/outboundgroup/fallback.go`; the manual workflow
-compiles the package remotely with `go build ./adapter/outboundgroup/...`.
+Apply both patches to the pinned core in the order shown in the [build instructions](../../.agents/commands.md#building).
+`enhance-fallback.patch` updates the group policy; its `--include=adapter/outboundgroup/fallback.go`
+filter applies to that patch only. Apply `fallback-udp.patch` in full for destination-specific UDP routing.
+The manual `build` workflow compiles the group package with `go build ./adapter/outboundgroup/...`.
 
 ## Shared contract
 
-- Each payload write has its own RTT-based 4–10 second deadline. Completed TCP
-  writes advance the response deadline. Incoming bytes complete the matching
-  exchange and refresh idle observation. Outstanding responses and idle flows
-  remain observable after expiry; the next write starts a fresh response window.
-- A real TCP response stall, early EOF with a pending request, strong I/O error, or UDP exchange that
-  goes silent moves that member behind alternatives **for the affected host** for
-  60 seconds. Other hosts keep their normal order. A matching reply clears the
-  host's evidence. A group with every member affected retains its normal order.
+- Each TCP write has its own RTT-based 4–10 second window to complete. For an
+  unanswered exchange, completed writes can extend the response deadline only
+  to two windows from the first unanswered write. Further accepted writes leave
+  the exchange stalled; a real downstream reply clears it.
+- If unsolicited data arrives after an established TCP stream's idle window
+  expires, the first write within one window of that data counts as a likely
+  reply rather than a new request. Its blocked-write deadline still applies.
+  This is a timing heuristic, independent of the payload protocol.
+- A TCP response stall, ordinary EOF with a request outstanding (even after an
+  earlier reply), a strong I/O error, or UDP silence can change the next route
+  **for the affected host** for 60 seconds. Host ranking reorders only proxy
+  slots; built-ins such as `DIRECT` and `REJECT` keep their positions in the
+  group's ordinary order. Other hosts keep their order. A matching reply clears
+  the member's evidence for that host. If every proxy is affected, their order holds.
 - Group-wide demotion requires three distinct strong-failure hosts in 60 seconds,
   or failure of the configured health URL while a peer succeeds. UDP silence,
-  pre-response EOF, canceled earlier dials and downstream idle periods are weak
+  ordinary EOF with a pending request, canceled earlier dials and idle periods are weak
   signals. Strong and weak checks coalesce with minimum gaps of 3 and 15 seconds.
-  Instance-owned cooldowns grow through 30, 60, 120, 240 and 300 seconds.
-- Shared UDP transports observe pending destinations separately. Replies from an
-  active destination keep its association useful while another exchange is silent.
-- Cleanup samples a stalled transport over two seconds. Active transfers and
-  healthy idle sessions keep their connections. Confirmed health failure can
-  retire a silent download. An established TCP stream reconnects through its
-  application; SimpleXray can replay up to 256 KiB before its first response.
+  Instance-owned cooldowns grow through 30, 60, 120, 240 and 300 seconds. In Go,
+  a member in cooldown still records individual host faults; the existing
+  group cooldown keeps its deadline.
+- Destinations sharing one local UDP endpoint use separate fallback upstream
+  associations. If A keeps receiving replies while B goes silent, A stays on
+  its healthy upstream and B can recover on another member independently.
+  A reply clears only the exchange for an unambiguously matched endpoint.
+- Idle alone triggers one weak health observation per continuous idle interval.
+  Once the idle window expires, cleanup can retire the session if its **serving
+  member** is confirmed failed or demoted and a two-second sample shows no
+  progress. Ordinary preference changes, recovery and manual selection preserve
+  healthy idle sessions. Go cleanup follows nested wrappers to find the
+  observation for the serving member. Transfers making progress stay connected.
+- An established TCP stream on a failed path needs the application to reconnect.
+  SimpleXray can replay a first flight of at most 256 KiB before the first reply.
 - The group-wide indicator describes the default candidate. A destination-specific
   route can already be using a backup while the indicator shows the primary.

@@ -1,12 +1,13 @@
 diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.go
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
-@@ -4,15 +4,590 @@ import (
+@@ -4,15 +4,662 @@ import (
  	"context"
  	"encoding/json"
  	"errors"
 +	"io"
 +	"net"
++	"net/netip"
 +	"sort"
 +	"strings"
 +	"sync"
@@ -69,8 +70,16 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +type fallbackExchange struct {
 +	host     string
 +	due      time.Time
++	limit    time.Time
 +	stalled  bool
 +	awaiting bool
++}
++
++func (x *fallbackExchange) advance(due time.Time) {
++	if !x.limit.IsZero() && due.After(x.limit) {
++		due = x.limit
++	}
++	x.due = due
 +}
 +
 +type fallbackWrite struct {
@@ -91,8 +100,11 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	timer          *time.Timer
 +	pending        map[string]*fallbackExchange
 +	addresses      map[string]string
++	domainByPort   map[string]string
++	numericTargets map[string]bool
 +	writes         map[*fallbackWrite]struct{}
 +	idleDue        time.Time
++	replyUntil     time.Time
 +	armedFor       time.Time
 +	lastProgress   time.Time
 +	lastSuccess    time.Time
@@ -104,7 +116,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	receiveEnded   bool
 +}
 +
-+func (o *fallbackObservation) beginWrite(key string) *fallbackWrite {
++func (o *fallbackObservation) beginWrite(key string, payload bool) *fallbackWrite {
 +	o.mux.Lock()
 +	defer o.mux.Unlock()
 +	if o.closed {
@@ -113,18 +125,24 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	host := o.host
 +	if key != "" {
 +		host = o.packetHost(key)
++		o.rememberTarget(key)
 +	}
 +	now := time.Now()
 +	w := &fallbackWrite{key: key, host: host, started: now}
 +	o.writes[w] = struct{}{}
-+	if !o.receiveEnded {
++	responding := o.strongTimeout && now.Before(o.replyUntil)
++	if payload {
++		o.replyUntil = time.Time{}
++	}
++	if payload && !responding && !o.receiveEnded {
 +		if x := o.pending[key]; x == nil {
-+			o.pending[key] = &fallbackExchange{host: host, due: now.Add(o.stallTimeout), awaiting: true}
-+		} else if !x.awaiting {
-+			x.awaiting, x.due = true, now.Add(o.stallTimeout)
++			x = &fallbackExchange{host: host, due: now.Add(o.stallTimeout), awaiting: true}
 +			if o.strongTimeout {
-+				x.stalled = false
++				x.limit = now.Add(2 * o.stallTimeout)
 +			}
++			o.pending[key] = x
++		} else if !o.strongTimeout && !x.awaiting {
++			x.awaiting, x.due = true, now.Add(o.stallTimeout)
 +		}
 +	}
 +	o.idleDue = time.Time{}
@@ -168,20 +186,18 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +	for key, x := range o.pending {
 +		if !now.Before(x.due) {
-+			// A fresh write has its own deadline; let actual upload progress settle first.
-+			for w := range o.writes {
-+				if w.key == key && !w.answered {
-+					x.due = w.started.Add(o.stallTimeout)
-+					break
++			if !x.stalled {
++				for w := range o.writes {
++					if w.key == key && !w.answered {
++						x.advance(w.started.Add(o.stallTimeout))
++						break
++					}
 +				}
 +			}
 +			if !now.Before(x.due) {
 +				x.stalled, x.awaiting = true, false
 +				o.group.reportEvidence(o.proxy, x.host, o.strongTimeout, true)
-+				if !o.cleanupPending && o.group.alternateFor(o.proxy, x.host, !o.strongTimeout) {
-+					o.cleanupPending = true
-+					go o.retireStalled(key, x, o.lastProgress)
-+				}
++				o.scheduleRetirementLocked(key, x)
 +				x.due = now.Add(o.group.effectiveProbeGap(false))
 +			}
 +		}
@@ -190,19 +206,38 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	if !o.idleDue.IsZero() {
 +		if !now.Before(o.idleDue) {
 +			o.idleObserved = true
++			o.idleDue = time.Time{}
 +			o.group.reportEvidence(o.proxy, o.host, false, false)
-+			o.idleDue = now.Add(o.group.effectiveProbeGap(false))
++			if o.group.memberDemoted(o.proxy) {
++				o.idleFailed = true
++				go o.retireIdle(o.lastProgress)
++			}
 +		}
 +		o.armLocked(o.idleDue)
 +	}
 +	o.mux.Unlock()
 +}
 +
++func (o *fallbackObservation) retireIdle(progress time.Time) {
++	time.Sleep(o.group.effectiveCloseSampleDelay())
++	if o.group.memberDemoted(o.proxy) && o.claimStall(progress) {
++		_ = o.closeTransport()
++	}
++}
++
++func (o *fallbackObservation) scheduleRetirementLocked(key string, x *fallbackExchange) {
++	if !o.closed && x.stalled && !o.cleanupPending && o.group.alternateFor(o.proxy, x.host, !o.strongTimeout) {
++		o.cleanupPending = true
++		go o.retireStalled(key, x, o.lastProgress)
++	}
++}
++
 +func (o *fallbackObservation) retireStalled(key string, x *fallbackExchange, progress time.Time) {
 +	time.Sleep(o.group.effectiveCloseSampleDelay())
 +	o.mux.Lock()
 +	o.cleanupPending = false
-+	retire := !o.closed && len(o.writes) == 0 && o.pending[key] == x && x.stalled && o.lastProgress == progress && o.group.alternateFor(o.proxy, x.host, !o.strongTimeout)
++	quiet := o.strongTimeout || (len(o.writes) == 0 && o.lastProgress == progress)
++	retire := !o.closed && quiet && o.pending[key] == x && x.stalled && o.group.alternateFor(o.proxy, x.host, !o.strongTimeout)
 +	if retire {
 +		o.closed = true
 +		o.stopTimerLocked()
@@ -231,16 +266,17 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +	if sent {
 +		now := time.Now()
-+		if o.strongTimeout || o.pending[w.key] == nil || !o.pending[w.key].stalled {
++		if x := o.pending[w.key]; x == nil || !x.stalled {
 +			o.lastProgress = now
 +		}
 +		o.idleObserved = false
 +		o.idleFailed = false
-+		if x := o.pending[w.key]; x != nil && !w.answered && o.strongTimeout {
-+			x.due, x.stalled = now.Add(o.stallTimeout), false
++		if x := o.pending[w.key]; x != nil && !x.stalled && !w.answered && o.strongTimeout {
++			x.advance(now.Add(o.stallTimeout))
++			o.armLocked(x.due)
 +		}
 +	}
-+	if err == nil && len(o.pending) == 0 && o.responded && !o.receiveEnded && o.idleDue.IsZero() {
++	if err == nil && len(o.pending) == 0 && o.responded && !o.receiveEnded && !o.idleObserved && o.idleDue.IsZero() {
 +		o.idleDue = time.Now().Add(o.stallTimeout)
 +		o.armLocked(o.idleDue)
 +	}
@@ -261,6 +297,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	}
 +	host := o.host
 +	if key != "" {
++		key = o.replyKey(key)
 +		host = o.packetHost(key)
 +	}
 +	x := o.pending[key]
@@ -274,6 +311,9 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		}
 +	}
 +	now := time.Now()
++	if o.strongTimeout && o.responded && x == nil && (o.idleObserved || (!o.idleDue.IsZero() && !now.Before(o.idleDue))) {
++		o.replyUntil = now.Add(o.stallTimeout)
++	}
 +	o.responded, o.lastProgress = true, now
 +	o.idleObserved = false
 +	o.idleFailed = false
@@ -293,12 +333,14 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	if o.closed || isIgnoredFallbackError(err) {
 +		return
 +	}
-+	if errors.Is(err, io.EOF) {
++	eof := errors.Is(err, io.EOF)
++	if eof {
 +		o.receiveEnded = true
 +	}
-+	if !o.responded || !errors.Is(err, io.EOF) {
++	pendingEOF := eof && o.strongTimeout && len(o.pending) > 0
++	if !o.responded || !eof || pendingEOF {
 +		strong := isStrongFallbackError(err)
-+		o.group.reportEvidence(o.proxy, o.host, strong, strong || (o.strongTimeout && len(o.pending) > 0 && errors.Is(err, io.EOF)))
++		o.group.reportEvidence(o.proxy, o.host, strong, strong || pendingEOF)
 +	}
 +	o.idleDue = time.Time{}
 +	for key := range o.pending {
@@ -335,25 +377,25 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	o.mux.Unlock()
 +}
 +
-+func (o *fallbackObservation) sampleStall(failedIdle bool) (time.Time, bool) {
++func (o *fallbackObservation) sampleStall() (time.Time, bool) {
 +	o.mux.Lock()
 +	defer o.mux.Unlock()
-+	if failedIdle && o.idleObserved {
++	if o.idleObserved {
 +		o.idleFailed = true
 +	}
 +	return o.lastProgress, o.stalledLocked()
 +}
 +
 +func (o *fallbackObservation) stalledLocked() bool {
-+	if o.closed || len(o.writes) != 0 {
++	if o.closed {
 +		return false
 +	}
 +	for _, x := range o.pending {
-+		if x.stalled {
++		if x.stalled && (o.strongTimeout || len(o.writes) == 0) {
 +			return true
 +		}
 +	}
-+	return o.idleFailed
++	return o.idleFailed && len(o.writes) == 0
 +}
 +
 +func (o *fallbackObservation) claimStall(progress time.Time) bool {
@@ -403,7 +445,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	if len(b) == 0 && !N.NeedHandshake(c.Conn) {
 +		return c.Conn.Write(b)
 +	}
-+	w := c.beginWrite("")
++	w := c.beginWrite("", len(b) > 0)
 +	n, err := c.Conn.Write(b)
 +	c.endWrite(w, n > 0, err)
 +	return n, err
@@ -414,7 +456,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	if size == 0 && !N.NeedHandshake(c.Conn) {
 +		return c.Conn.WriteBuffer(buffer)
 +	}
-+	w := c.beginWrite("")
++	w := c.beginWrite("", size > 0)
 +	err := c.Conn.WriteBuffer(buffer)
 +	c.endWrite(w, err == nil && size > 0, err)
 +	return err
@@ -468,7 +510,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	if len(b) == 0 {
 +		return c.PacketConn.WriteTo(b, addr)
 +	}
-+	w := c.beginWrite(fallbackPacketKey(addr))
++	w := c.beginWrite(fallbackPacketKey(addr), true)
 +	n, err := c.PacketConn.WriteTo(b, addr)
 +	c.endWrite(w, n > 0, err)
 +	return n, err
@@ -531,26 +573,56 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	return key
 +}
 +
-+func fallbackStateFor(tracker statistic.Tracker, group *Fallback, proxy C.Proxy) *fallbackObservation {
-+	outer, ok := tracker.(N.WithUpstream)
-+	if !ok {
-+		return nil
++func (o *fallbackObservation) rememberTarget(key string) {
++	host, port, err := net.SplitHostPort(key)
++	if err != nil {
++		return
 +	}
-+	value := outer.Upstream()
-+	for {
-+		wrapped, ok := value.(interface {
-+			fallbackState() *fallbackObservation
-+			Upstream() any
-+		})
-+		if !ok {
-+			return nil
++	if _, err := netip.ParseAddr(host); err == nil {
++		o.numericTargets[key] = true
++	} else if previous, ok := o.domainByPort[port]; !ok || previous == key {
++		o.domainByPort[port] = key
++	} else {
++		o.domainByPort[port] = ""
++	}
++}
++
++func (o *fallbackObservation) replyKey(key string) string {
++	if o.pending[key] != nil || o.numericTargets[key] {
++		return key
++	}
++	host, port, err := net.SplitHostPort(key)
++	if err != nil {
++		return key
++	}
++	if _, err := netip.ParseAddr(host); err != nil {
++		return key
++	}
++	domain := o.domainByPort[port]
++	if resolved, ok := o.addresses[key]; ok {
++		domain = net.JoinHostPort(resolved, port)
++	}
++	if o.pending[domain] != nil {
++		return domain
++	}
++	return key
++}
++
++func fallbackStateFor(tracker statistic.Tracker, group *Fallback, proxy C.Proxy) *fallbackObservation {
++	for value := any(tracker); value != nil; {
++		if observed, ok := value.(interface{ fallbackState() *fallbackObservation }); ok {
++			state := observed.fallbackState()
++			if state.group == group && state.proxy == proxy {
++				return state
++			}
 +		}
-+		state := wrapped.fallbackState()
-+		if state.group == group && state.proxy == proxy {
-+			return state
++		wrapped, ok := value.(N.WithUpstream)
++		if !ok {
++			break
 +		}
 +		value = wrapped.Upstream()
 +	}
++	return nil
 +}
 +
 +var _ C.Conn = (*fallbackObserverConn)(nil)
@@ -593,7 +665,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  type FallbackOption struct{}
  
  type Fallback struct {
-@@ -21,6 +596,504 @@ type Fallback struct {
+@@ -21,6 +668,520 @@ type Fallback struct {
  	testUrl        string
  	selected       string
  	expectedStatus string
@@ -732,7 +804,13 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	return now.Before(st.cooldownUntil)
 +}
 +
-+func (f *Fallback) demoteProxyIfOwner(proxy C.Proxy, owner *proxyFailState, reason string, failedIdle bool) {
++func (f *Fallback) memberDemoted(proxy C.Proxy) bool {
++	f.stateMux.Lock()
++	defer f.stateMux.Unlock()
++	return f.isDemotedLocked(proxy, time.Now()) && f.proxyStateLocked(proxy) != nil
++}
++
++func (f *Fallback) demoteProxyIfOwner(proxy C.Proxy, owner *proxyFailState, reason string) {
 +	if proxy == nil || isSkippableAdapter(proxy.Type()) {
 +		return
 +	}
@@ -773,15 +851,13 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	f.stateMux.Unlock()
 +
 +	log.Warnln("Fallback[%s]: proxy %s demoted for %v (%s)", f.Name(), name, cooldown, reason)
-+	go f.closeStalledConnectionsForProxy(proxy, st, failedIdle)
++	go f.closeStalledConnectionsForProxy(proxy, st)
 +}
 +
-+func (f *Fallback) closeStalledConnectionsForProxy(proxy C.Proxy, owner *proxyFailState, failedIdle bool) {
++func (f *Fallback) closeStalledConnectionsForProxy(proxy C.Proxy, owner *proxyFailState) {
 +	type trafficSample struct {
 +		observer *fallbackObservation
 +		progress time.Time
-+		upload   int64
-+		download int64
 +	}
 +	samples := make(map[statistic.Tracker]trafficSample)
 +	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
@@ -789,9 +865,8 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		if observer == nil {
 +			return true
 +		}
-+		progress, stalled := observer.sampleStall(failedIdle)
-+		if info := c.Info(); stalled && info != nil {
-+			samples[c] = trafficSample{observer: observer, progress: progress, upload: info.UploadTotal.Load(), download: info.DownloadTotal.Load()}
++		if progress, stalled := observer.sampleStall(); stalled {
++			samples[c] = trafficSample{observer: observer, progress: progress}
 +		}
 +		return true
 +	})
@@ -801,14 +876,10 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	time.Sleep(f.effectiveCloseSampleDelay())
 +	closedCount := 0
 +	for c, sample := range samples {
-+		info := c.Info()
-+		if info == nil {
-+			continue
-+		}
 +		f.stateMux.Lock()
 +		current := f.proxyStates[proxy.Name()] == owner && f.proxyStateLocked(proxy) == owner
 +		f.stateMux.Unlock()
-+		if current && info.UploadTotal.Load() == sample.upload && info.DownloadTotal.Load() == sample.download && sample.observer.claimStall(sample.progress) {
++		if current && sample.observer.claimStall(sample.progress) {
 +			if conn, ok := c.(interface{ SetWriteDeadline(time.Time) error }); ok {
 +				_ = conn.SetWriteDeadline(time.Now())
 +			}
@@ -893,7 +964,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +
 +	f.stateMux.Lock()
 +	st := f.proxyStateLocked(proxy)
-+	if st == nil || now.Before(st.cooldownUntil) {
++	if st == nil {
 +		f.stateMux.Unlock()
 +		return
 +	}
@@ -903,9 +974,12 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		}
 +		st.affectedHosts[host] = now
 +	}
++	if now.Before(st.cooldownUntil) {
++		f.stateMux.Unlock()
++		return
++	}
 +
-+	// Only strong signals (watchdog stall / reset / timeout) count toward multi-host demotion.
-+	// Weak signals (e.g. io.EOF from a dead target site) only trigger at most a comparative probe.
++	// Only strong signals count toward multi-host demotion; destination evidence is independent.
 +	if strong {
 +		if st.suspectHosts == nil {
 +			st.suspectHosts = make(map[string]time.Time)
@@ -941,7 +1015,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	f.stateMux.Unlock()
 +
 +	if shouldDemoteMultiHost {
-+		f.demoteProxyIfOwner(proxy, owner, "multiple distinct hosts stalled/failed", false)
++		f.demoteProxyIfOwner(proxy, owner, "multiple distinct hosts stalled/failed")
 +		return
 +	}
 +
@@ -1027,12 +1101,24 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +		ctx, cancel := context.WithTimeout(context.Background(), f.probeTimeoutForProxy(proxy))
 +		defer cancel()
 +
++		peerWasAlive := peer != nil && peer.AliveForTestUrl(f.testUrl)
 +		errSelf, errPeer := f.probePair(ctx, proxy, peer)
 +		// Comparative health results apply to the current proxy instance and state owner.
 +		if errSelf != nil && errPeer == nil {
-+			f.demoteProxyIfOwner(proxy, owner, "comparative URLTest failed while peer ok: "+errSelf.Error(), true)
++			f.demoteProxyIfOwner(proxy, owner, "comparative URLTest failed while peer ok: "+errSelf.Error())
 +		} else if errSelf != nil && f.findAliveProxy(false) != proxy {
-+			go f.closeStalledConnectionsForProxy(proxy, owner, true)
++			go f.closeStalledConnectionsForProxy(proxy, owner)
++		} else if errPeer == nil && !peerWasAlive {
++			statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
++				if o := fallbackStateFor(c, f, proxy); o != nil {
++					o.mux.Lock()
++					for key, x := range o.pending {
++						o.scheduleRetirementLocked(key, x)
++					}
++					o.mux.Unlock()
++				}
++				return true
++			})
 +		}
 +	}()
 +}
@@ -1093,12 +1179,14 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +	host := metadataHostKey(metadata)
 +	o := f.observe(proxy, host, false, func() error { _ = c.SetWriteDeadline(time.Now()); return c.Close() })
 +	o.addresses = make(map[string]string)
++	o.domainByPort = make(map[string]string)
++	o.numericTargets = make(map[string]bool)
 +	o.rememberAddress(metadata, host)
 +	return &fallbackObserverPacketConn{PacketConn: c, fallbackObservation: o}
  }
  
  func (f *Fallback) Now() string {
-@@ -28,38 +1101,203 @@ func (f *Fallback) Now() string {
+@@ -28,38 +1189,203 @@ func (f *Fallback) Now() string {
  	return proxy.Name()
  }
  
@@ -1322,7 +1410,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  // SupportUDP implements C.ProxyAdapter
-@@ -67,14 +1305,17 @@ func (f *Fallback) SupportUDP() bool {
+@@ -67,14 +1393,17 @@ func (f *Fallback) SupportUDP() bool {
  	if f.disableUDP {
  		return false
  	}
@@ -1344,7 +1432,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  // MarshalJSON implements C.ProxyAdapter
-@@ -83,13 +1324,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+@@ -83,13 +1412,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
  	for _, proxy := range f.GetProxies(false) {
  		all = append(all, proxy.Name())
  	}
@@ -1362,7 +1450,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  		"hidden":         f.Hidden(),
  		"icon":           f.Icon(),
  		"emptyFallback":  f.EmptyFallback().Name(),
-@@ -98,29 +1342,151 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+@@ -98,29 +1430,160 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
  
  // Unwrap implements C.ProxyAdapter
  func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
@@ -1474,18 +1562,27 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
 +				if f.affectedLocked(p, host, now) {
 +					return 2
 +				}
-+				if isSkippableAdapter(p.Type()) || f.isDemotedLocked(p, now) || !p.AliveForTestUrl(f.testUrl) {
++				if f.isDemotedLocked(p, now) || !p.AliveForTestUrl(f.testUrl) {
 +					return 1
 +				}
 +				return 0
 +			}
-+			sort.SliceStable(candidates, func(i, j int) bool { return rank(candidates[i]) < rank(candidates[j]) })
++			members := make([]C.Proxy, 0, len(candidates))
++			for _, p := range candidates {
++				if !isSkippableAdapter(p.Type()) {
++					members = append(members, p)
++				}
++			}
++			sort.SliceStable(members, func(i, j int) bool { return rank(members[i]) < rank(members[j]) })
++			hasUnmarked := len(members) > 0 && rank(members[0]) < 2
 +			for i, p := range candidates {
-+				if rank(p) == 2 {
-+					if i > 0 {
-+						ordinary = i
-+					}
-+					break
++				builtin := isSkippableAdapter(p.Type())
++				if !builtin {
++					p, members = members[0], members[1:]
++					candidates[i] = p
++				}
++				if i > 0 && ordinary == len(candidates) && (builtin || (hasUnmarked && rank(p) == 2)) {
++					ordinary = i
 +				}
 +			}
 +		}
@@ -1526,7 +1623,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  func (f *Fallback) Set(name string) error {
-@@ -136,7 +1502,14 @@ func (f *Fallback) Set(name string) error {
+@@ -136,7 +1599,14 @@ func (f *Fallback) Set(name string) error {
  		return errors.New("proxy not exist")
  	}
  
@@ -1541,7 +1638,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  	if !p.AliveForTestUrl(f.testUrl) {
  		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
  		defer cancel()
-@@ -148,7 +1521,13 @@ func (f *Fallback) Set(name string) error {
+@@ -148,7 +1618,13 @@ func (f *Fallback) Set(name string) error {
  }
  
  func (f *Fallback) ForceSet(name string) {
@@ -1555,7 +1652,7 @@ diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.
  }
  
  func (f *Fallback) Providers() []P.ProxyProvider {
-@@ -178,5 +1557,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+@@ -178,5 +1654,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
  		expectedStatus: option.ExpectedStatus,

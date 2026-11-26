@@ -103,7 +103,7 @@ sudo apt-get install ninja-build libgtk-3-dev libsecret-1-dev
 
 Windows:
 
-- GCC and Inno Setup.
+- The Flutter Windows toolchain for the app and Inno Setup for the installer. The desktop Go core builds with `CGO_ENABLED=0`.
 
 macOS:
 
